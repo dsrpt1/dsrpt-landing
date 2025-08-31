@@ -71,15 +71,38 @@ function useInjected() {
   const [address, setAddress] = useState<string>("");
   const [chainId, setChainId] = useState<number | null>(null);
 
-  const connect = async () => {
-    if (!(window as any).ethereum) throw new Error("No wallet injected");
-    const prov = new ethers.BrowserProvider((window as any).ethereum);
-    await prov.send("eth_requestAccounts", []);
-    const s = await prov.getSigner();
-    const a = await s.getAddress();
-    const n = await prov.getNetwork();
-    setProvider(prov); setSigner(s); setAddress(a); setChainId(Number(n.chainId));
-  };
+ const [networkName, setNetworkName] = useState<string>("");
+
+const connect = async () => {
+  if (!(window as any).ethereum) throw new Error("No wallet injected");
+  const prov = new ethers.BrowserProvider((window as any).ethereum);
+  await prov.send("eth_requestAccounts", []);
+  const s = await prov.getSigner();
+  const a = await s.getAddress();
+  const n = await prov.getNetwork();
+  setProvider(prov);
+  setSigner(s);
+  setAddress(a);
+  setChainId(Number(n.chainId));
+  setNetworkName(n.name ?? (Number(n.chainId) === SEPOLIA_ID_DEC ? "sepolia" : `chain ${Number(n.chainId)}`));
+};
+
+const switchToSepolia = async () => {
+  await ensureSepolia();
+  // Refresh provider/signer state after switch
+  const prov = new ethers.BrowserProvider((window as any).ethereum);
+  const s = await prov.getSigner();
+  const a = await s.getAddress();
+  const n = await prov.getNetwork();
+  setProvider(prov);
+  setSigner(s);
+  setAddress(a);
+  setChainId(Number(n.chainId));
+  setNetworkName(n.name ?? (Number(n.chainId) === SEPOLIA_ID_DEC ? "sepolia" : `chain ${Number(n.chainId)}`));
+};
+
+return { provider, signer, address, chainId, networkName, connect, switchToSepolia };
+
 
   useEffect(() => {
     const eth = (window as any).ethereum;
@@ -117,6 +140,36 @@ function Stat({label, value}:{label:string; value:React.ReactNode}){
 
 export default function DSRPTLanding() {
   const { provider, signer, address, chainId, connect } = useInjected();
+const SEPOLIA_ID_DEC = 11155111;
+const SEPOLIA_ID_HEX = "0xaa36a7"; // 11155111 in hex
+
+async function ensureSepolia() {
+  const eth = (window as any).ethereum;
+  if (!eth) throw new Error("No wallet found");
+  try {
+    await eth.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: SEPOLIA_ID_HEX }],
+    });
+  } catch (err: any) {
+    // 4902 = chain not added
+    if (err?.code === 4902) {
+      await eth.request({
+        method: "wallet_addEthereumChain",
+        params: [{
+          chainId: SEPOLIA_ID_HEX,
+          chainName: "Sepolia",
+          nativeCurrency: { name: "Sepolia Ether", symbol: "SEP", decimals: 18 },
+          // Use your own RPC with key so rate limits don’t bite:
+          rpcUrls: [process.env.NEXT_PUBLIC_SEPOLIA_RPC ?? "https://rpc.ankr.com/eth_sepolia/<YOUR_KEY>"],
+          blockExplorerUrls: ["https://sepolia.etherscan.io/"],
+        }],
+      });
+    } else {
+      throw err;
+    }
+  }
+}
 
   // Addresses
   const [tokenAddr, setTokenAddr] = useState(DEFAULTS.token);
@@ -228,8 +281,31 @@ export default function DSRPTLanding() {
           <span className="text-cyan-300">DSRPT</span>
           <span className="opacity-70"> · Parametric Depeg Cover</span>
         </h1>
-        <GhostBtn onClick={connect}>{address ? `${address.slice(0,6)}…${address.slice(-4)}` : "Connect Wallet"}</GhostBtn>
+        <GhostBtn onClick={connect}>
+  {address ? `${address.slice(0,6)}…${address.slice(-4)} · ${networkName || (chainId ?? "—")}` : "Connect Wallet"}
+</GhostBtn>
+
       </header>
+{chainId !== null && chainId !== SEPOLIA_ID_DEC && (
+  <div className="max-w-6xl mx-auto px-6 mt-3">
+    <div className="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="font-medium">Wrong network detected</div>
+          <div className="opacity-80">
+            Connected to <span className="font-mono">{networkName || `chain ${chainId}`}</span>. Please switch to <b>Sepolia (11155111)</b>.
+          </div>
+        </div>
+        <button
+          onClick={switchToSepolia}
+          className="rounded-lg px-3 py-2 bg-cyan-400/90 text-black font-medium hover:bg-cyan-300"
+        >
+          Switch to Sepolia
+        </button>
+      </div>
+    </div>
+  </div>
+)}
 
       <main className="max-w-6xl mx-auto px-6 pb-24">
         {/* Top Stats */}
