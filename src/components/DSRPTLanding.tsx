@@ -70,8 +70,51 @@ function useInjected() {
   const [signer, setSigner] = useState<ethers.Signer | null>(null);
   const [address, setAddress] = useState<string>("");
   const [chainId, setChainId] = useState<number | null>(null);
+  const [networkName, setNetworkName] = useState<string>("");
 
- const [networkName, setNetworkName] = useState<string>("");
+  const refreshFromEth = async () => {
+    const eth = (window as any).ethereum;
+    if (!eth) return;
+    const prov = new ethers.BrowserProvider(eth);
+    const s = await prov.getSigner();
+    const a = await s.getAddress();
+    const n = await prov.getNetwork();
+    setProvider(prov);
+    setSigner(s);
+    setAddress(a);
+    setChainId(Number(n.chainId));
+    setNetworkName(n?.name ?? (Number(n.chainId) === SEPOLIA_ID_DEC ? "sepolia" : `chain ${Number(n.chainId)}`));
+  };
+
+  const connect = async () => {
+    if (!(window as any).ethereum) throw new Error("No wallet injected");
+    const prov = new ethers.BrowserProvider((window as any).ethereum);
+    await prov.send("eth_requestAccounts", []);
+    await refreshFromEth();
+  };
+
+  const switchToSepolia = async () => {
+    await ensureSepolia();
+    await refreshFromEth();
+  };
+
+  useEffect(() => {
+    const eth = (window as any).ethereum;
+    if (!eth) return;
+    const onAcc = () => refreshFromEth();
+    const onChain = () => refreshFromEth();
+    eth.on?.("accountsChanged", onAcc);
+    eth.on?.("chainChanged", onChain);
+    return () => {
+      eth.removeListener?.("accountsChanged", onAcc);
+      eth.removeListener?.("chainChanged", onChain);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return { provider, signer, address, chainId, networkName, connect, switchToSepolia };
+}
+
 
 const connect = async () => {
   if (!(window as any).ethereum) throw new Error("No wallet injected");
@@ -282,18 +325,22 @@ async function ensureSepolia() {
           <span className="opacity-70"> · Parametric Depeg Cover</span>
         </h1>
         <GhostBtn onClick={connect}>
-  {address ? `${address.slice(0,6)}…${address.slice(-4)} · ${networkName || (chainId ?? "—")}` : "Connect Wallet"}
+  {address
+    ? `${address.slice(0, 6)}…${address.slice(-4)} · ${networkName || (chainId ?? "—")}`
+    : "Connect Wallet"}
 </GhostBtn>
+
 
       </header>
 {chainId !== null && chainId !== SEPOLIA_ID_DEC && (
   <div className="max-w-6xl mx-auto px-6 mt-3">
     <div className="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3">
         <div>
           <div className="font-medium">Wrong network detected</div>
           <div className="opacity-80">
-            Connected to <span className="font-mono">{networkName || `chain ${chainId}`}</span>. Please switch to <b>Sepolia (11155111)</b>.
+            Connected to <span className="font-mono">{networkName || `chain ${chainId}`}</span>. Please switch to{" "}
+            <b>Sepolia (11155111)</b>.
           </div>
         </div>
         <button
@@ -306,6 +353,7 @@ async function ensureSepolia() {
     </div>
   </div>
 )}
+
 
       <main className="max-w-6xl mx-auto px-6 pb-24">
         {/* Top Stats */}
