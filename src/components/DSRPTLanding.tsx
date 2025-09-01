@@ -3,7 +3,9 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { ethers } from "ethers";
 
-/* ------------------------------ Constants ------------------------------ */
+/* -------------------------------------------------------------------------- */
+/*                                  CONSTANTS                                  */
+/* -------------------------------------------------------------------------- */
 
 const DEFAULTS = {
   token: (process.env.NEXT_PUBLIC_TOKEN ??
@@ -16,73 +18,79 @@ const DEFAULTS = {
 
 const SEPOLIA_ID_DEC = 11155111;
 const SEPOLIA_ID_HEX = "0xaa36a7";
-const PUBLIC_RPC = process.env.NEXT_PUBLIC_SEPOLIA_RPC ?? ""; // optional, used when adding chain
+const PUBLIC_RPC = process.env.NEXT_PUBLIC_SEPOLIA_RPC ?? ""; // used when adding chain
 
-// UI constants (feel free to tweak)
-const PREMIUM_BPS = 500n; // 5% (per 10_000)
-const TOKEN_DECIMALS = 6n; // MockUSD = 6 decimals
+const TOKEN_DECIMALS = 6n; // MockUSD = 6
+const PREMIUM_BPS = 500n; // 5% of payout
 
-/* --------------------------------- ABIs -------------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                     ABIs                                   */
+/* -------------------------------------------------------------------------- */
 
-// Minimal ERC20
 const ERC20_ABI = [
   "function name() view returns (string)",
   "function symbol() view returns (string)",
   "function decimals() view returns (uint8)",
   "function balanceOf(address) view returns (uint256)",
-  "function approve(address spender, uint256 amount) returns (bool)",
-  "function allowance(address owner, address spender) view returns (uint256)",
-  "function mint(address,uint256)", // mock-only
+  "function approve(address,uint256) returns (bool)",
+  "function allowance(address owner,address spender) view returns (uint256)",
+  "function mint(address,uint256)", // mock
 ] as const;
 
-// Minimal Oracle (mock)
 const ORACLE_ABI = [
   "function setPrice(int256) external",
   "function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)",
 ] as const;
 
-// Minimal Cover
 const COVER_ABI = [
   "function fundPool(uint256) external",
-  "function buyPolicy(uint64 durationSeconds) external",
-  "function triggerAndPayout(address user) external",
-  // views (if your contract exposes them – these are optional helpers)
+  "function buyPolicy(uint64) external",
+  "function triggerAndPayout(address) external",
+  // Optional view; your solidity may include this:
   "function poolBalance() view returns (uint256)",
 ] as const;
 
-/* ------------------------- Helpers / formatting ------------------------- */
+/* -------------------------------------------------------------------------- */
+/*                                   HELPERS                                  */
+/* -------------------------------------------------------------------------- */
 
-function toUnits(n: bigint, decimals: bigint = TOKEN_DECIMALS) {
-  return ethers.parseUnits(n.toString(), Number(decimals));
+function numToRaw6(v: string): bigint | null {
+  if (!v?.trim()) return 0n;
+  if (!isFinite(Number(v))) return null;
+  const [i, f = ""] = v.split(".");
+  const frac = (f + "000000").slice(0, 6);
+  return BigInt(i || "0") * 10n ** TOKEN_DECIMALS + BigInt(frac || "0");
 }
-function fromUnits(x?: bigint, decimals: bigint = TOKEN_DECIMALS) {
-  if (x === undefined) return "-";
-  return ethers.formatUnits(x, Number(decimals));
+function fromRaw6(x?: bigint) {
+  if (x === undefined || x === null) return "-";
+  return ethers.formatUnits(x, Number(TOKEN_DECIMALS));
 }
-function numToBig(value: string): bigint | null {
-  if (!value || isNaN(Number(value))) return null;
-  // value is decimal string (e.g., "1000")
-  const [intPart, fracPart = ""] = value.split(".");
-  const frac = (fracPart + "000000").slice(0, 6); // 6 decimals
-  const raw = BigInt(intPart || "0") * 10n ** TOKEN_DECIMALS + BigInt(frac || "0");
-  return raw;
+function withCommas(n: string) {
+  const [i, f] = n.split(".");
+  return `${i.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}${f ? "." + f : ""}`;
+}
+function secToExpiryISO(seconds: string): string {
+  const s = Number(seconds || "0");
+  if (!isFinite(s) || s <= 0) return "—";
+  const d = new Date(Date.now() + s * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(
+    2,
+    "0"
+  )} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(
+    d.getSeconds()
+  ).padStart(2, "0")}`;
 }
 
-/* ----------------------------- Network Guard ---------------------------- */
+/* ------------------------------- Network Guard ------------------------------- */
 
 async function ensureSepolia(): Promise<void> {
   const eth = (globalThis as any).ethereum;
   if (!eth) throw new Error("No injected wallet found");
 
   try {
-    await eth.request({
-      method: "wallet_switchEthereumChain",
-      params: [{ chainId: SEPOLIA_ID_HEX }],
-    });
-  } catch (err: unknown) {
-    const e = err as { code?: number; message?: string };
-    if (e?.code === 4902) {
-      // Add chain then retry switch
+    await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: SEPOLIA_ID_HEX }] });
+  } catch (err: any) {
+    if (err?.code === 4902) {
       await eth.request({
         method: "wallet_addEthereumChain",
         params: [
@@ -95,36 +103,23 @@ async function ensureSepolia(): Promise<void> {
           },
         ],
       });
-      await eth.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId: SEPOLIA_ID_HEX }],
-      });
+      await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: SEPOLIA_ID_HEX }] });
     } else {
       throw err;
     }
   }
 }
 
-/* ------------------------------ Wallet Hook ---------------------------- */
+/* -------------------------------- Wallet Hook ------------------------------- */
 
-type InjectedState = {
-  provider: ethers.BrowserProvider | null;
-  signer: ethers.Signer | null;
-  address: string;
-  chainId: number | null;
-  networkName: string;
-  connect: () => Promise<void>;
-  switchToSepolia: () => Promise<void>;
-};
-
-function useInjected(): InjectedState {
+function useInjected() {
   const [provider, setProvider] = useState<ethers.BrowserProvider | null>(null);
   const [signer, setSigner] = useState<ethers.Signer | null>(null);
   const [address, setAddress] = useState<string>("");
   const [chainId, setChainId] = useState<number | null>(null);
   const [networkName, setNetworkName] = useState<string>("");
 
-  const refreshFromEth = async () => {
+  const refresh = async () => {
     const eth = (globalThis as any).ethereum;
     if (!eth) return;
     const prov = new ethers.BrowserProvider(eth);
@@ -144,19 +139,19 @@ function useInjected(): InjectedState {
     if (!eth) throw new Error("No wallet injected");
     const prov = new ethers.BrowserProvider(eth);
     await prov.send("eth_requestAccounts", []);
-    await refreshFromEth();
+    await refresh();
   };
 
   const switchToSepolia = async () => {
     await ensureSepolia();
-    await refreshFromEth();
+    await refresh();
   };
 
   useEffect(() => {
     const eth = (globalThis as any).ethereum;
     if (!eth) return;
-    const onAcc = () => refreshFromEth();
-    const onChain = () => refreshFromEth();
+    const onAcc = () => refresh();
+    const onChain = () => refresh();
     eth.on?.("accountsChanged", onAcc);
     eth.on?.("chainChanged", onChain);
     return () => {
@@ -169,13 +164,13 @@ function useInjected(): InjectedState {
   return { provider, signer, address, chainId, networkName, connect, switchToSepolia };
 }
 
-/* ------------------------------ UI Elements ---------------------------- */
+/* --------------------------------- UI Bits --------------------------------- */
 
 type BtnProps = React.ButtonHTMLAttributes<HTMLButtonElement> & { className?: string };
 const GhostBtn: React.FC<BtnProps> = ({ className = "", ...p }) => (
   <button
     {...p}
-    className={`px-3 py-2 rounded-xl border border-white/20 hover:bg-white/10 transition ${className}`}
+    className={`px-3 py-2 rounded-xl border border-white/20 hover:bg-white/10 transition disabled:opacity-50 ${className}`}
   />
 );
 const PrimaryBtn: React.FC<BtnProps> = ({ className = "", ...p }) => (
@@ -219,7 +214,7 @@ const Field: React.FC<{
   </label>
 );
 
-/* ------------------------------- Component ----------------------------- */
+/* -------------------------------- COMPONENT -------------------------------- */
 
 export default function DSRPTLanding() {
   const { provider, signer, address, chainId, networkName, connect, switchToSepolia } = useInjected();
@@ -233,100 +228,57 @@ export default function DSRPTLanding() {
   const [poolBalance, setPoolBalance] = useState<bigint>(0n);
   const [myBal, setMyBal] = useState<bigint>(0n);
   const [allowance, setAllowance] = useState<bigint>(0n);
-  const [oraclePrice, setOraclePrice] = useState<string>("1.000000"); // human (1.000000)
-  const [payoutStr, setPayoutStr] = useState<string>("1000"); // desired payout in mUSD (human)
-  const [durationSec, setDurationSec] = useState<string>("604800"); // 7d
+  const [oraclePrice, setOraclePrice] = useState<string>("1.000000"); // human
+  const [payoutStr, setPayoutStr] = useState<string>("1000");
+  const [durationSec, setDurationSec] = useState<string>("604800");
   const [fundStr, setFundStr] = useState<string>("20000");
 
-  const payoutRaw = useMemo(() => numToBig(payoutStr) ?? 0n, [payoutStr]);
+  // UX
+  const [busy, setBusy] = useState<string>(""); // which action is in-flight
+  const [err, setErr] = useState<string>(""); // last human-readable error
+  const wrongChain = chainId !== null && chainId !== SEPOLIA_ID_DEC;
+
+  // Derived
+  const payoutRaw = useMemo(() => numToRaw6(payoutStr) ?? 0n, [payoutStr]);
   const premiumRaw = useMemo(() => (payoutRaw * PREMIUM_BPS) / 10000n, [payoutRaw]);
 
-  const token = useMemo(
-    () => (signer ? new ethers.Contract(TOKEN, ERC20_ABI, signer) : null),
-    [signer, TOKEN]
-  );
-  const cover = useMemo(
-    () => (signer ? new ethers.Contract(COVER, COVER_ABI, signer) : null),
-    [signer, COVER]
-  );
-  const oracle = useMemo(
-    () => (signer ? new ethers.Contract(ORACLE, ORACLE_ABI, signer) : null),
-    [signer, ORACLE]
-  );
+  // Contracts
+  const token = useMemo(() => (signer ? new ethers.Contract(TOKEN, ERC20_ABI, signer) : null), [signer, TOKEN]);
+  const cover = useMemo(() => (signer ? new ethers.Contract(COVER, COVER_ABI, signer) : null), [signer, COVER]);
+  const oracle = useMemo(() => (signer ? new ethers.Contract(ORACLE, ORACLE_ABI, signer) : null), [signer, ORACLE]);
+
+  /* --------------------------------- Reads --------------------------------- */
 
   const readState = async () => {
-    if (!provider || !address) return;
+    setErr("");
     try {
-      const erc20 = new ethers.Contract(TOKEN, ERC20_ABI, provider);
-      const bal = (await erc20.balanceOf(address)) as bigint;
-      const alw = (await erc20.allowance(address, COVER)) as bigint;
-      setMyBal(bal);
-      setAllowance(alw);
-    } catch {
-      // ignore read errors
+      if (provider && address) {
+        const erc20 = new ethers.Contract(TOKEN, ERC20_ABI, provider);
+        const bal = (await erc20.balanceOf(address)) as bigint;
+        const alw = (await erc20.allowance(address, COVER)) as bigint;
+        setMyBal(bal);
+        setAllowance(alw);
+      }
+    } catch (e: any) {
+      // ignore
     }
     try {
-      const cov = new ethers.Contract(COVER, COVER_ABI, provider);
-      if (cov.poolBalance) {
+      const cov = new ethers.Contract(COVER, COVER_ABI, provider ?? undefined);
+      if ((cov as any).poolBalance) {
         const pb = (await cov.poolBalance()) as bigint;
         setPoolBalance(pb);
       }
     } catch {
-      // optional view might not exist
+      // optional
     }
     try {
-      const orc = new ethers.Contract(ORACLE, ORACLE_ABI, provider);
+      const orc = new ethers.Contract(ORACLE, ORACLE_ABI, provider ?? undefined);
       const [, answer] = (await orc.latestRoundData()) as [bigint, bigint, bigint, bigint, bigint];
-      // Assume price has 8 decimals (Chainlink style). Render as 1.000000
-      const scaled = Number(answer) / 1e8;
-      setOraclePrice(scaled.toFixed(6));
+      const scaled = Number(answer) / 1e8; // assume 8 decimals chainlink-style
+      setOraclePrice(isFinite(scaled) ? scaled.toFixed(6) : "—");
     } catch {
       // ignore
     }
-  };
-
-  /* ------------------------------- Actions ------------------------------ */
-
-  const doApprovePremium = async () => {
-    if (!token) return;
-    const tx = await token.approve(COVER, premiumRaw);
-    await tx.wait?.();
-    await readState();
-  };
-
-  const doBuyPolicy = async () => {
-    if (!cover) return;
-    const dur = BigInt(Number(durationSec) || 0);
-    const tx = await cover.buyPolicy(Number(dur)); // contract expects uint64; ethers will coerce
-    await tx.wait?.();
-  };
-
-  const doFundPool = async () => {
-    if (!token || !cover) return;
-    const amt = numToBig(fundStr) ?? 0n;
-    const approveTx = await token.approve(COVER, amt);
-    await approveTx.wait?.();
-    const fundTx = await cover.fundPool(amt);
-    await fundTx.wait?.();
-    await readState();
-  };
-
-  const doTrigger = async () => {
-    if (!cover) return;
-    const tx = await cover.triggerAndPayout(address);
-    await tx.wait?.();
-    await readState();
-  };
-
-  const doSetPrice = async () => {
-    if (!oracle) return;
-    // Expect oracle to store 8-decimals price like 0.96000000 = 96000000
-    const [intPart, frac = ""] = oraclePrice.split(".");
-    const pad = (frac + "00000000").slice(0, 8);
-    const raw = BigInt(`${intPart || "0"}${pad}`); // int256
-    const tx = await oracle.setPrice(raw);
-    await tx.wait?.();
-    await readState();
   };
 
   useEffect(() => {
@@ -334,9 +286,109 @@ export default function DSRPTLanding() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider, address]);
 
-  /* --------------------------------- UI --------------------------------- */
+  /* -------------------------------- Actions -------------------------------- */
 
-  const wrongChain = chainId !== null && chainId !== SEPOLIA_ID_DEC;
+  async function guardReady() {
+    if (!address) throw new Error("Connect your wallet first.");
+    if (wrongChain) throw new Error("Wrong network. Please switch to Sepolia.");
+    if (!signer) throw new Error("No signer available.");
+  }
+
+  const doApprovePremium = async () => {
+    try {
+      await guardReady();
+      if (!token) throw new Error("Token not set");
+      if (premiumRaw <= 0n) throw new Error("Premium must be > 0");
+      setBusy("approve-premium");
+      const tx = await token.approve(COVER, premiumRaw);
+      await tx.wait?.();
+      await readState();
+    } catch (e: any) {
+      setErr(e?.message || "Approve failed");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const doBuyPolicy = async () => {
+    try {
+      await guardReady();
+      if (!cover || !token) throw new Error("Contracts not ready");
+      if (premiumRaw <= 0n) throw new Error("Premium must be > 0");
+      // Auto-approve if allowance is short
+      if (allowance < premiumRaw) {
+        setBusy("approve-premium-auto");
+        const txA = await token.approve(COVER, premiumRaw);
+        await txA.wait?.();
+        await readState();
+      }
+      const dur = BigInt(durationSec || "0");
+      if (dur <= 0n) throw new Error("Duration must be > 0");
+      setBusy("buy");
+      const tx = await cover.buyPolicy(Number(dur)); // uint64 OK
+      await tx.wait?.();
+      await readState();
+    } catch (e: any) {
+      setErr(e?.message || "Buy policy failed");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const doFundPool = async () => {
+    try {
+      await guardReady();
+      if (!cover || !token) throw new Error("Contracts not ready");
+      const amt = numToRaw6(fundStr) ?? 0n;
+      if (amt <= 0n) throw new Error("Fund amount must be > 0");
+      setBusy("approve-fund");
+      const txA = await token.approve(COVER, amt);
+      await txA.wait?.();
+      setBusy("fund");
+      const txF = await cover.fundPool(amt);
+      await txF.wait?.();
+      await readState();
+    } catch (e: any) {
+      setErr(e?.message || "Funding failed");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const doSetPrice = async () => {
+    try {
+      await guardReady();
+      if (!oracle) throw new Error("Oracle not set");
+      const [i, f = ""] = oraclePrice.split(".");
+      const pad = (f + "00000000").slice(0, 8);
+      const raw = BigInt(`${i || "0"}${pad}`);
+      setBusy("price");
+      const tx = await oracle.setPrice(raw);
+      await tx.wait?.();
+      await readState();
+    } catch (e: any) {
+      setErr(e?.message || "Set price failed");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const doTrigger = async () => {
+    try {
+      await guardReady();
+      if (!cover) throw new Error("Cover not set");
+      setBusy("trigger");
+      const tx = await cover.triggerAndPayout(address);
+      await tx.wait?.();
+      await readState();
+    } catch (e: any) {
+      setErr(e?.message || "Trigger failed");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /* ---------------------------------- UI ---------------------------------- */
 
   return (
     <main className="min-h-screen bg-black text-white">
@@ -347,22 +399,14 @@ export default function DSRPTLanding() {
             DSRPT <span className="text-cyan-400">Depeg Cover</span>
           </div>
           <div className="flex items-center gap-3">
-            {address && (
-              <div className="text-xs text-white/70 hidden sm:block">
-                {networkName || (chainId ?? "—")}
-              </div>
-            )}
-            <GhostBtn onClick={connect}>
-              {address
-                ? `${address.slice(0, 6)}…${address.slice(-4)}`
-                : "Connect Wallet"}
-            </GhostBtn>
+            {address && <div className="text-xs text-white/70 hidden sm:block">{networkName}</div>}
+            <GhostBtn onClick={connect}>{address ? `${address.slice(0, 6)}…${address.slice(-4)}` : "Connect Wallet"}</GhostBtn>
           </div>
         </div>
       </header>
 
-      {/* Wrong network banner */}
-      {wrongChain && (
+      {/* Wrong network */}
+      {chainId !== null && chainId !== SEPOLIA_ID_DEC && (
         <div className="max-w-6xl mx-auto px-6 mt-3">
           <div className="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm">
             <div className="flex items-center justify-between gap-3">
@@ -379,7 +423,21 @@ export default function DSRPTLanding() {
         </div>
       )}
 
-      {/* Hero / Addresses */}
+      {/* Error / Status */}
+      <div className="max-w-6xl mx-auto px-6 mt-3 space-y-2">
+        {busy && (
+          <div className="rounded-lg border border-cyan-400/30 bg-cyan-400/10 px-3 py-2 text-sm">
+            <span className="font-medium">Working:</span> {busy}
+          </div>
+        )}
+        {err && (
+          <div className="rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-sm">
+            <span className="font-medium">Error:</span> {err}
+          </div>
+        )}
+      </div>
+
+      {/* Top cards */}
       <section className="max-w-6xl mx-auto px-6 py-8">
         <div className="grid md:grid-cols-3 gap-5">
           <Card title="Active Contracts">
@@ -397,11 +455,11 @@ export default function DSRPTLanding() {
             <div className="text-sm">
               <div className="flex items-center justify-between">
                 <div className="text-white/70">mUSD Balance</div>
-                <div className="font-mono">{fromUnits(myBal)}</div>
+                <div className="font-mono">{withCommas(fromRaw6(myBal))}</div>
               </div>
               <div className="flex items-center justify-between mt-1">
                 <div className="text-white/70">Allowance → Cover</div>
-                <div className="font-mono">{fromUnits(allowance)}</div>
+                <div className="font-mono">{withCommas(fromRaw6(allowance))}</div>
               </div>
             </div>
           </Card>
@@ -410,7 +468,7 @@ export default function DSRPTLanding() {
             <div className="text-sm">
               <div className="flex items-center justify-between">
                 <div className="text-white/70">Pool Balance</div>
-                <div className="font-mono">{fromUnits(poolBalance)}</div>
+                <div className="font-mono">{withCommas(fromRaw6(poolBalance))}</div>
               </div>
               <div className="flex items-center justify-between mt-1">
                 <div className="text-white/70">Oracle Price</div>
@@ -421,40 +479,78 @@ export default function DSRPTLanding() {
         </div>
       </section>
 
-      {/* Coverage Builder */}
+      {/* Coverage Builder + Policy Preview + Owner Controls */}
       <section className="max-w-6xl mx-auto px-6 pb-10">
-        <div className="grid lg:grid-cols-2 gap-6">
-          <Card title="Coverage Builder">
-            <Field
-              label="Desired Payout (mUSD)"
-              value={payoutStr}
-              onChange={setPayoutStr}
-              placeholder="1000"
-              right={<div className="text-xs text-white/60 pr-1">mUSD</div>}
-              type="number"
-            />
-            <Field
-              label="Duration (seconds)"
-              value={durationSec}
-              onChange={setDurationSec}
-              placeholder="604800"
-              type="number"
-            />
-            <div className="flex items-center justify-between mt-2 text-sm">
-              <div className="text-white/70">Premium (5%)</div>
-              <div className="font-mono">{fromUnits(premiumRaw)}</div>
-            </div>
-            <div className="mt-4 flex gap-2">
-              <PrimaryBtn onClick={doApprovePremium} disabled={!address || wrongChain || premiumRaw === 0n}>
-                Approve Premium
-              </PrimaryBtn>
-              <PrimaryBtn onClick={doBuyPolicy} disabled={!address || wrongChain || premiumRaw === 0n}>
-                Buy Policy
-              </PrimaryBtn>
+        <div className="grid lg:grid-cols-3 gap-6">
+          {/* Builder */}
+          <div className="lg:col-span-2">
+            <Card title="Coverage Builder">
+              <Field
+                label="Desired Payout (mUSD)"
+                value={payoutStr}
+                onChange={setPayoutStr}
+                placeholder="1000"
+                right={<div className="text-xs text-white/60 pr-1">mUSD</div>}
+                type="number"
+              />
+              <Field
+                label="Duration (seconds)"
+                value={durationSec}
+                onChange={setDurationSec}
+                placeholder="604800"
+                type="number"
+              />
+              <div className="flex items-center justify-between mt-2 text-sm">
+                <div className="text-white/70">Premium (5%)</div>
+                <div className="font-mono">{withCommas(fromRaw6(premiumRaw))}</div>
+              </div>
+              <div className="mt-4 flex gap-2">
+                <PrimaryBtn onClick={doApprovePremium} disabled={!address || wrongChain || premiumRaw === 0n || !!busy}>
+                  {busy === "approve-premium" ? "Approving…" : "Approve Premium"}
+                </PrimaryBtn>
+                <PrimaryBtn
+                  onClick={doBuyPolicy}
+                  disabled={!address || wrongChain || premiumRaw === 0n || !!busy}
+                >
+                  {busy?.startsWith("approve-premium-auto") || busy === "buy" ? "Buying…" : "Buy Policy"}
+                </PrimaryBtn>
+              </div>
+            </Card>
+          </div>
+
+          {/* Policy Preview */}
+          <Card title="Policy Preview">
+            <div className="space-y-3 text-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-white/70">Payout</span>
+                <span className="font-mono">{withCommas(fromRaw6(payoutRaw))}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-white/70">Premium (5%)</span>
+                <span className="font-mono">{withCommas(fromRaw6(premiumRaw))}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-white/70">Duration</span>
+                <span className="font-mono">
+                  {Number(durationSec || "0") > 0 ? `${Number(durationSec)}s` : "—"}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-white/70">Est. Expiry (local)</span>
+                <span className="font-mono">{secToExpiryISO(durationSec)}</span>
+              </div>
+              <div className="h-px bg-white/10" />
+              <div className="text-xs text-white/60">
+                Parametric cover: if the oracle price drops below the threshold during your coverage window, payout equals
+                the selected amount.
+              </div>
             </div>
           </Card>
+        </div>
 
-          <Card title="Owner / Oracle Controls">
+        {/* Owner / Oracle Controls */}
+        <div className="grid lg:grid-cols-2 gap-6 mt-6">
+          <Card title="Pool Funding">
             <Field
               label="Fund Amount (mUSD)"
               value={fundStr}
@@ -463,13 +559,13 @@ export default function DSRPTLanding() {
               type="number"
             />
             <div className="flex gap-2">
-              <PrimaryBtn onClick={doFundPool} disabled={!address || wrongChain}>
-                Approve & Fund Pool
+              <PrimaryBtn onClick={doFundPool} disabled={!address || wrongChain || !!busy}>
+                {busy === "approve-fund" || busy === "fund" ? "Funding…" : "Approve & Fund Pool"}
               </PrimaryBtn>
             </div>
+          </Card>
 
-            <div className="h-px bg-white/10 my-4" />
-
+          <Card title="Oracle / Payout">
             <Field
               label="Oracle Price (e.g., 0.960000)"
               value={oraclePrice}
@@ -478,11 +574,11 @@ export default function DSRPTLanding() {
               type="text"
             />
             <div className="flex gap-2">
-              <GhostBtn onClick={doSetPrice} disabled={!address || wrongChain}>
-                Set Oracle Price
+              <GhostBtn onClick={doSetPrice} disabled={!address || wrongChain || !!busy}>
+                {busy === "price" ? "Setting…" : "Set Oracle Price"}
               </GhostBtn>
-              <PrimaryBtn onClick={doTrigger} disabled={!address || wrongChain}>
-                Trigger Payout
+              <PrimaryBtn onClick={doTrigger} disabled={!address || wrongChain || !!busy}>
+                {busy === "trigger" ? "Triggering…" : "Trigger Payout"}
               </PrimaryBtn>
             </div>
           </Card>
