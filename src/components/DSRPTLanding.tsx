@@ -1,71 +1,123 @@
+"use client";
+
 import React, { useEffect, useMemo, useState } from "react";
 import { ethers } from "ethers";
 
-/**
- * DSRPT — Parametric Depeg Cover (V2) · One‑page Futuristic UI
- * - Connect wallet
- * - Configure contract addresses (token/oracle/cover)
- * - Read live state (rates, pool, your policy)
- * - Owner ops: approve + fund pool, pause, set params (subset shown)
- * - User ops: choose coverage (linear pricing), approve premium, buy
- * - Oracle ops: set mock price (for demo), trigger payout
- *
- * Assumptions
- * - Token has 6 decimals (USDC-style)
- * - Oracle price uses 8 decimals (e.g., $0.96 → 96000000)
- * - Contracts are already deployed on Sepolia
- */
+/* ------------------------------ Constants ------------------------------ */
 
-// === Constants ===
-const TOKEN_DECIMALS = 6n; // MockUSD
-const FEED_DECIMALS = 8n;  // MockOracle default
+const DEFAULTS = {
+  token: (process.env.NEXT_PUBLIC_TOKEN ??
+    "0x112B36dB8d5e0Ab86174E71737d64A51591A6868") as `0x${string}`,
+  oracle: (process.env.NEXT_PUBLIC_ORACLE ??
+    "0x67dC9b9B24f89930D13fB72b28EE898369D5349B") as `0x${string}`,
+  cover: (process.env.NEXT_PUBLIC_COVER ??
+    "0x34f6bCE92A6E1c142B7089Ae66Be62CFdc9A3e8B") as `0x${string}`,
+};
 
-// === Minimal ABIs ===
-const erc20Abi = [
+const SEPOLIA_ID_DEC = 11155111;
+const SEPOLIA_ID_HEX = "0xaa36a7";
+const PUBLIC_RPC = process.env.NEXT_PUBLIC_SEPOLIA_RPC ?? ""; // optional, used when adding chain
+
+// UI constants (feel free to tweak)
+const PREMIUM_BPS = 500n; // 5% (per 10_000)
+const TOKEN_DECIMALS = 6n; // MockUSD = 6 decimals
+
+/* --------------------------------- ABIs -------------------------------- */
+
+// Minimal ERC20
+const ERC20_ABI = [
   "function name() view returns (string)",
   "function symbol() view returns (string)",
   "function decimals() view returns (uint8)",
   "function balanceOf(address) view returns (uint256)",
-  "function allowance(address,address) view returns (uint256)",
-  "function approve(address,uint256) returns (bool)",
-  "function transfer(address,uint256) returns (bool)",
-  "function transferFrom(address,address,uint256) returns (bool)",
-  "function mint(address,uint256)"
-];
+  "function approve(address spender, uint256 amount) returns (bool)",
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function mint(address,uint256)", // mock-only
+] as const;
 
-const oracleAbi = [
-  "function setPrice(int256)",
-  "function decimals() view returns (uint8)",
-  "function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)"
-];
+// Minimal Oracle (mock)
+const ORACLE_ABI = [
+  "function setPrice(int256) external",
+  "function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)",
+] as const;
 
-const coverAbi = [
-  "function payoutToken() view returns (address)",
-  "function fixedPremium() view returns (uint256)",
-  "function fixedPayout() view returns (uint256)",
-  "function poolCap() view returns (uint256)",
-  "function minPolicySecs() view returns (uint256)",
-  "function maxPolicySecs() view returns (uint256)",
-  "function heartbeatSecs() view returns (uint256)",
-  "function paused() view returns (bool)",
-  "function policies(address) view returns (uint256 premium, uint256 payout, uint64 purchasedAt, uint64 expiresAt, bool paid, bool active)",
-  "function fundPool(uint256)",
-  "function setPaused(bool)",
-  "function setParams(uint256,uint256,uint256,uint256,uint256,uint256)",
-  "function setMaxPolicyPayout(uint256)",
-  "function buyPolicy(uint64)",
-  "function buyPolicyForCoverage(uint64,uint256)",
-];
+// Minimal Cover
+const COVER_ABI = [
+  "function fundPool(uint256) external",
+  "function buyPolicy(uint64 durationSeconds) external",
+  "function triggerAndPayout(address user) external",
+  // views (if your contract exposes them – these are optional helpers)
+  "function poolBalance() view returns (uint256)",
+] as const;
 
-// === Default (Sepolia) — replace if needed ===
-const DEFAULTS = {
-  token: "0x112B36dB8d5e0Ab86174E71737d64A51591A6868",
-  oracle: "0x67dC9b9B24f89930D13fB72b28EE898369D5349B",
-  cover:  "0x34f6bCE92A6E1c142B7089Ae66Be62CFdc9A3e8B",
+/* ------------------------- Helpers / formatting ------------------------- */
+
+function toUnits(n: bigint, decimals: bigint = TOKEN_DECIMALS) {
+  return ethers.parseUnits(n.toString(), Number(decimals));
+}
+function fromUnits(x?: bigint, decimals: bigint = TOKEN_DECIMALS) {
+  if (x === undefined) return "-";
+  return ethers.formatUnits(x, Number(decimals));
+}
+function numToBig(value: string): bigint | null {
+  if (!value || isNaN(Number(value))) return null;
+  // value is decimal string (e.g., "1000")
+  const [intPart, fracPart = ""] = value.split(".");
+  const frac = (fracPart + "000000").slice(0, 6); // 6 decimals
+  const raw = BigInt(intPart || "0") * 10n ** TOKEN_DECIMALS + BigInt(frac || "0");
+  return raw;
+}
+
+/* ----------------------------- Network Guard ---------------------------- */
+
+async function ensureSepolia(): Promise<void> {
+  const eth = (globalThis as any).ethereum;
+  if (!eth) throw new Error("No injected wallet found");
+
+  try {
+    await eth.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: SEPOLIA_ID_HEX }],
+    });
+  } catch (err: unknown) {
+    const e = err as { code?: number; message?: string };
+    if (e?.code === 4902) {
+      // Add chain then retry switch
+      await eth.request({
+        method: "wallet_addEthereumChain",
+        params: [
+          {
+            chainId: SEPOLIA_ID_HEX,
+            chainName: "Sepolia",
+            nativeCurrency: { name: "Sepolia Ether", symbol: "SEP", decimals: 18 },
+            rpcUrls: PUBLIC_RPC ? [PUBLIC_RPC] : ["https://rpc.sepolia.org"],
+            blockExplorerUrls: ["https://sepolia.etherscan.io/"],
+          },
+        ],
+      });
+      await eth.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: SEPOLIA_ID_HEX }],
+      });
+    } else {
+      throw err;
+    }
+  }
+}
+
+/* ------------------------------ Wallet Hook ---------------------------- */
+
+type InjectedState = {
+  provider: ethers.BrowserProvider | null;
+  signer: ethers.Signer | null;
+  address: string;
+  chainId: number | null;
+  networkName: string;
+  connect: () => Promise<void>;
+  switchToSepolia: () => Promise<void>;
 };
 
-// === Helpers ===
-function useInjected() {
+function useInjected(): InjectedState {
   const [provider, setProvider] = useState<ethers.BrowserProvider | null>(null);
   const [signer, setSigner] = useState<ethers.Signer | null>(null);
   const [address, setAddress] = useState<string>("");
@@ -73,22 +125,24 @@ function useInjected() {
   const [networkName, setNetworkName] = useState<string>("");
 
   const refreshFromEth = async () => {
-    const eth = (window as any).ethereum;
+    const eth = (globalThis as any).ethereum;
     if (!eth) return;
     const prov = new ethers.BrowserProvider(eth);
     const s = await prov.getSigner();
     const a = await s.getAddress();
     const n = await prov.getNetwork();
+    const cid = Number(n.chainId);
     setProvider(prov);
     setSigner(s);
     setAddress(a);
-    setChainId(Number(n.chainId));
-    setNetworkName(n?.name ?? (Number(n.chainId) === SEPOLIA_ID_DEC ? "sepolia" : `chain ${Number(n.chainId)}`));
+    setChainId(cid);
+    setNetworkName(n?.name ?? (cid === SEPOLIA_ID_DEC ? "sepolia" : `chain ${cid}`));
   };
 
   const connect = async () => {
-    if (!(window as any).ethereum) throw new Error("No wallet injected");
-    const prov = new ethers.BrowserProvider((window as any).ethereum);
+    const eth = (globalThis as any).ethereum;
+    if (!eth) throw new Error("No wallet injected");
+    const prov = new ethers.BrowserProvider(eth);
     await prov.send("eth_requestAccounts", []);
     await refreshFromEth();
   };
@@ -99,7 +153,7 @@ function useInjected() {
   };
 
   useEffect(() => {
-    const eth = (window as any).ethereum;
+    const eth = (globalThis as any).ethereum;
     if (!eth) return;
     const onAcc = () => refreshFromEth();
     const onChain = () => refreshFromEth();
@@ -115,369 +169,330 @@ function useInjected() {
   return { provider, signer, address, chainId, networkName, connect, switchToSepolia };
 }
 
+/* ------------------------------ UI Elements ---------------------------- */
 
-const connect = async () => {
-  if (!(window as any).ethereum) throw new Error("No wallet injected");
-  const prov = new ethers.BrowserProvider((window as any).ethereum);
-  await prov.send("eth_requestAccounts", []);
-  const s = await prov.getSigner();
-  const a = await s.getAddress();
-  const n = await prov.getNetwork();
-  setProvider(prov);
-  setSigner(s);
-  setAddress(a);
-  setChainId(Number(n.chainId));
-  setNetworkName(n.name ?? (Number(n.chainId) === SEPOLIA_ID_DEC ? "sepolia" : `chain ${Number(n.chainId)}`));
-};
+type BtnProps = React.ButtonHTMLAttributes<HTMLButtonElement> & { className?: string };
+const GhostBtn: React.FC<BtnProps> = ({ className = "", ...p }) => (
+  <button
+    {...p}
+    className={`px-3 py-2 rounded-xl border border-white/20 hover:bg-white/10 transition ${className}`}
+  />
+);
+const PrimaryBtn: React.FC<BtnProps> = ({ className = "", ...p }) => (
+  <button
+    {...p}
+    className={`px-3 py-2 rounded-xl bg-cyan-400 text-black font-semibold hover:bg-cyan-300 disabled:opacity-50 ${className}`}
+  />
+);
 
-const switchToSepolia = async () => {
-  await ensureSepolia();
-  // Refresh provider/signer state after switch
-  const prov = new ethers.BrowserProvider((window as any).ethereum);
-  const s = await prov.getSigner();
-  const a = await s.getAddress();
-  const n = await prov.getNetwork();
-  setProvider(prov);
-  setSigner(s);
-  setAddress(a);
-  setChainId(Number(n.chainId));
-  setNetworkName(n.name ?? (Number(n.chainId) === SEPOLIA_ID_DEC ? "sepolia" : `chain ${Number(n.chainId)}`));
-};
+const Card: React.FC<{ title: string; children: React.ReactNode; className?: string }> = ({
+  title,
+  children,
+  className = "",
+}) => (
+  <div className={`rounded-2xl border border-white/10 bg-white/[0.03] p-5 ${className}`}>
+    <div className="text-sm uppercase tracking-wide text-white/60 mb-2">{title}</div>
+    {children}
+  </div>
+);
 
-return { provider, signer, address, chainId, networkName, connect, switchToSepolia };
-
-
-  useEffect(() => {
-    const eth = (window as any).ethereum;
-    if (!eth) return;
-    const onAcc = async () => {
-      const prov = new ethers.BrowserProvider(eth);
-      const s = await prov.getSigner();
-      setSigner(s); setAddress(await s.getAddress());
-    };
-    eth.on?.("accountsChanged", onAcc);
-    eth.on?.("chainChanged", () => window.location.reload());
-    return () => { eth.removeListener?.("accountsChanged", onAcc); };
-  }, []);
-
-  return { provider, signer, address, chainId, connect };
-}
-
-function fmtUnits(value?: bigint, decimals: bigint = 6n) {
-  if (value === undefined || value === null) return "-";
-  const neg = value < 0n; const v = neg ? -value : value;
-  const base = 10n ** decimals;
-  const whole = v / base; const frac = v % base;
-  const fracStr = frac.toString().padStart(Number(decimals), '0').replace(/0+$/, '');
-  return `${neg ? '-' : ''}${whole}${fracStr ? '.' + fracStr : ''}`;
-}
-
-function Stat({label, value}:{label:string; value:React.ReactNode}){
-  return (
-    <div className="rounded-2xl bg-white/5 border border-white/10 p-4">
-      <div className="text-xs uppercase tracking-wide opacity-60">{label}</div>
-      <div className="text-lg mt-1 font-medium">{value}</div>
+const Field: React.FC<{
+  label: string;
+  value: string | number;
+  onChange?: (v: string) => void;
+  placeholder?: string;
+  right?: React.ReactNode;
+  type?: string;
+}> = ({ label, value, onChange, placeholder, right, type = "text" }) => (
+  <label className="block mb-3">
+    <div className="text-xs text-white/60 mb-1">{label}</div>
+    <div className="flex items-center gap-2">
+      <input
+        type={type}
+        value={value}
+        onChange={(e) => onChange?.(e.target.value)}
+        placeholder={placeholder}
+        className="w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 outline-none focus:border-cyan-400"
+      />
+      {right}
     </div>
-  );
-}
+  </label>
+);
+
+/* ------------------------------- Component ----------------------------- */
 
 export default function DSRPTLanding() {
-  const { provider, signer, address, chainId, connect } = useInjected();
-const SEPOLIA_ID_DEC = 11155111;
-const SEPOLIA_ID_HEX = "0xaa36a7"; // 11155111 in hex
+  const { provider, signer, address, chainId, networkName, connect, switchToSepolia } = useInjected();
 
-async function ensureSepolia() {
-  const eth = (window as any).ethereum;
-  if (!eth) throw new Error("No wallet found");
-  try {
-    await eth.request({
-      method: "wallet_switchEthereumChain",
-      params: [{ chainId: SEPOLIA_ID_HEX }],
-    });
-  } catch (err: any) {
-    // 4902 = chain not added
-    if (err?.code === 4902) {
-      await eth.request({
-        method: "wallet_addEthereumChain",
-        params: [{
-          chainId: SEPOLIA_ID_HEX,
-          chainName: "Sepolia",
-          nativeCurrency: { name: "Sepolia Ether", symbol: "SEP", decimals: 18 },
-          // Use your own RPC with key so rate limits don’t bite:
-          rpcUrls: [process.env.NEXT_PUBLIC_SEPOLIA_RPC ?? "https://rpc.ankr.com/eth_sepolia/<YOUR_KEY>"],
-          blockExplorerUrls: ["https://sepolia.etherscan.io/"],
-        }],
-      });
-    } else {
-      throw err;
+  // Addresses (env overrides supported)
+  const TOKEN = DEFAULTS.token;
+  const ORACLE = DEFAULTS.oracle;
+  const COVER = DEFAULTS.cover;
+
+  // Local state
+  const [poolBalance, setPoolBalance] = useState<bigint>(0n);
+  const [myBal, setMyBal] = useState<bigint>(0n);
+  const [allowance, setAllowance] = useState<bigint>(0n);
+  const [oraclePrice, setOraclePrice] = useState<string>("1.000000"); // human (1.000000)
+  const [payoutStr, setPayoutStr] = useState<string>("1000"); // desired payout in mUSD (human)
+  const [durationSec, setDurationSec] = useState<string>("604800"); // 7d
+  const [fundStr, setFundStr] = useState<string>("20000");
+
+  const payoutRaw = useMemo(() => numToBig(payoutStr) ?? 0n, [payoutStr]);
+  const premiumRaw = useMemo(() => (payoutRaw * PREMIUM_BPS) / 10000n, [payoutRaw]);
+
+  const token = useMemo(
+    () => (signer ? new ethers.Contract(TOKEN, ERC20_ABI, signer) : null),
+    [signer, TOKEN]
+  );
+  const cover = useMemo(
+    () => (signer ? new ethers.Contract(COVER, COVER_ABI, signer) : null),
+    [signer, COVER]
+  );
+  const oracle = useMemo(
+    () => (signer ? new ethers.Contract(ORACLE, ORACLE_ABI, signer) : null),
+    [signer, ORACLE]
+  );
+
+  const readState = async () => {
+    if (!provider || !address) return;
+    try {
+      const erc20 = new ethers.Contract(TOKEN, ERC20_ABI, provider);
+      const bal = (await erc20.balanceOf(address)) as bigint;
+      const alw = (await erc20.allowance(address, COVER)) as bigint;
+      setMyBal(bal);
+      setAllowance(alw);
+    } catch {
+      // ignore read errors
     }
-  }
-}
-
-  // Addresses
-  const [tokenAddr, setTokenAddr] = useState(DEFAULTS.token);
-  const [oracleAddr, setOracleAddr] = useState(DEFAULTS.oracle);
-  const [coverAddr, setCoverAddr]   = useState(DEFAULTS.cover);
-
-  // Reads
-  const [tokenSymbol, setTokenSymbol] = useState("mUSD");
-  const [fixedPremium, setFixedPremium] = useState<bigint>(5_000_000n);
-  const [fixedPayout, setFixedPayout]   = useState<bigint>(100_000_000n);
-  const [poolCap, setPoolCap] = useState<bigint>(0n);
-  const [poolBal, setPoolBal] = useState<bigint>(0n);
-  const [paused, setPaused] = useState(false);
-  const [heartbeat, setHeartbeat] = useState<bigint>(5400n);
-  const [policy, setPolicy] = useState<any>(null);
-  const [oraclePrice, setOraclePrice] = useState<bigint>(100_000_000n);
-
-  // Inputs
-  const [fundAmount, setFundAmount] = useState("20000"); // mUSD (human)
-  const [desiredPayout, setDesiredPayout] = useState("1000"); // mUSD
-  const [durationDays, setDurationDays] = useState(7);
-  const [depegDisplay, setDepegDisplay] = useState("0.96");
-
-  // Contracts
-  const token = useMemo(() => (provider ? new ethers.Contract(tokenAddr, erc20Abi, signer ?? provider) : null), [provider, signer, tokenAddr]);
-  const cover = useMemo(() => (provider ? new ethers.Contract(coverAddr, coverAbi, signer ?? provider) : null), [provider, signer, coverAddr]);
-  const oracle = useMemo(() => (provider ? new ethers.Contract(oracleAddr, oracleAbi, signer ?? provider) : null), [provider, signer, oracleAddr]);
-
-  // Derived premium (linear pricing)
-  const computedPremium = useMemo(() => {
     try {
-      const payout = ethers.parseUnits(desiredPayout || "0", Number(TOKEN_DECIMALS));
-      if (fixedPayout === 0n) return 0n;
-      return (fixedPremium * payout) / fixedPayout;
-    } catch { return 0n; }
-  }, [desiredPayout, fixedPremium, fixedPayout]);
-
-  const load = async () => {
+      const cov = new ethers.Contract(COVER, COVER_ABI, provider);
+      if (cov.poolBalance) {
+        const pb = (await cov.poolBalance()) as bigint;
+        setPoolBalance(pb);
+      }
+    } catch {
+      // optional view might not exist
+    }
     try {
-      if (!provider) return;
-      const c = new ethers.Contract(coverAddr, coverAbi, provider);
-      const t = new ethers.Contract(tokenAddr, erc20Abi, provider);
-      const o = new ethers.Contract(oracleAddr, oracleAbi, provider);
-      const [sym, fprem, fpayout, pc, pausedNow, hb, pol, poolTokenBal, round] = await Promise.all([
-        t.symbol(), c.fixedPremium(), c.fixedPayout(), c.poolCap(), c.paused(), c.heartbeatSecs(), address ? c.policies(address) : Promise.resolve(null), t.balanceOf(coverAddr), o.latestRoundData()
-      ]);
-      setTokenSymbol(sym); setFixedPremium(fprem); setFixedPayout(fpayout); setPoolCap(pc); setPaused(pausedNow); setHeartbeat(hb); setPolicy(pol); setPoolBal(poolTokenBal);
-      if (round && Array.isArray(round)) setOraclePrice(round[1]);
-    } catch (e) { console.error(e); }
+      const orc = new ethers.Contract(ORACLE, ORACLE_ABI, provider);
+      const [, answer] = (await orc.latestRoundData()) as [bigint, bigint, bigint, bigint, bigint];
+      // Assume price has 8 decimals (Chainlink style). Render as 1.000000
+      const scaled = Number(answer) / 1e8;
+      setOraclePrice(scaled.toFixed(6));
+    } catch {
+      // ignore
+    }
   };
 
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, [provider, address, tokenAddr, coverAddr, oracleAddr]);
+  /* ------------------------------- Actions ------------------------------ */
 
-  // Actions
-  const doApproveFunding = async () => {
-    if (!token) return; const amt = ethers.parseUnits(fundAmount || "0", Number(TOKEN_DECIMALS));
-    const tx = await token.approve(coverAddr, amt); await tx.wait(); await load();
-  };
-  const doFundPool = async () => {
-    if (!cover) return; const amt = ethers.parseUnits(fundAmount || "0", Number(TOKEN_DECIMALS));
-    const tx = await cover.fundPool(amt); await tx.wait(); await load();
-  };
   const doApprovePremium = async () => {
-    if (!token) return; const tx = await token.approve(coverAddr, computedPremium);
-    await tx.wait(); await load();
+    if (!token) return;
+    const tx = await token.approve(COVER, premiumRaw);
+    await tx.wait?.();
+    await readState();
   };
+
   const doBuyPolicy = async () => {
-    if (!cover) return; const secs = BigInt(Math.round(durationDays * 24 * 60 * 60));
-    const payout = ethers.parseUnits(desiredPayout || "0", Number(TOKEN_DECIMALS));
-    const tx = await cover.buyPolicyForCoverage(secs, payout); await tx.wait(); await load();
+    if (!cover) return;
+    const dur = BigInt(Number(durationSec) || 0);
+    const tx = await cover.buyPolicy(Number(dur)); // contract expects uint64; ethers will coerce
+    await tx.wait?.();
   };
-  const doSetOracle = async () => {
-    if (!oracle) return; const [w, f = ""] = depegDisplay.split(".");
-    const norm = w + (f + "0".repeat(Number(FEED_DECIMALS))).slice(0, Number(FEED_DECIMALS));
-    const px = BigInt(norm); const tx = await oracle.setPrice(px); await tx.wait(); await load();
+
+  const doFundPool = async () => {
+    if (!token || !cover) return;
+    const amt = numToBig(fundStr) ?? 0n;
+    const approveTx = await token.approve(COVER, amt);
+    await approveTx.wait?.();
+    const fundTx = await cover.fundPool(amt);
+    await fundTx.wait?.();
+    await readState();
   };
-  const doTrigger = async () => { if (!cover || !address) return; const tx = await cover.triggerAndPayout(address); await tx.wait(); await load(); };
 
-  // UI building blocks
-  const Card = ({title, children}:{title:string; children:any}) => (
-    <div className="rounded-2xl p-6 bg-white/5 border border-white/10 shadow">
-      <div className="flex items-center justify-between mb-4">
-        <h3 className="text-lg font-medium">{title}</h3>
-      </div>
-      {children}
-    </div>
-  );
+  const doTrigger = async () => {
+    if (!cover) return;
+    const tx = await cover.triggerAndPayout(address);
+    await tx.wait?.();
+    await readState();
+  };
 
-  const PrimaryBtn = (props:any) => (
-    <button {...props} className={(props.className??"") + " rounded-xl px-4 py-2 bg-cyan-400/90 text-black font-medium hover:bg-cyan-300 transition disabled:opacity-50 disabled:cursor-not-allowed"} />
-  );
-  const GhostBtn = (props:any) => (
-    <button {...props} className={(props.className??"") + " rounded-xl px-4 py-2 bg-white/10 hover:bg-white/20 transition disabled:opacity-50 disabled:cursor-not-allowed"} />
-  );
-  const Input = (props:any) => (
-    <input {...props} className={(props.className??"") + " w-full rounded-xl bg-white/10 px-3 py-2 outline-none focus:ring-2 ring-cyan-400"} />
-  );
-  const Label = ({children}:{children:any}) => (
-    <label className="block text-sm opacity-70 mb-1">{children}</label>
-  );
+  const doSetPrice = async () => {
+    if (!oracle) return;
+    // Expect oracle to store 8-decimals price like 0.96000000 = 96000000
+    const [intPart, frac = ""] = oraclePrice.split(".");
+    const pad = (frac + "00000000").slice(0, 8);
+    const raw = BigInt(`${intPart || "0"}${pad}`); // int256
+    const tx = await oracle.setPrice(raw);
+    await tx.wait?.();
+    await readState();
+  };
+
+  useEffect(() => {
+    if (provider && address) readState();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider, address]);
+
+  /* --------------------------------- UI --------------------------------- */
+
+  const wrongChain = chainId !== null && chainId !== SEPOLIA_ID_DEC;
 
   return (
-    <div className="min-h-screen bg-black text-white">
-      {/* Gradient aura */}
-      <div className="fixed inset-0 -z-10 pointer-events-none bg-[radial-gradient(circle_at_20%_20%,rgba(34,211,238,0.18),transparent_40%),radial-gradient(circle_at_80%_30%,rgba(167,139,250,0.18),transparent_45%),radial-gradient(circle_at_40%_80%,rgba(74,222,128,0.15),transparent_40%)]" />
-
-      <header className="max-w-6xl mx-auto px-6 py-6 flex items-center justify-between">
-        <h1 className="text-2xl md:text-3xl font-semibold tracking-tight">
-          <span className="text-cyan-300">DSRPT</span>
-          <span className="opacity-70"> · Parametric Depeg Cover</span>
-        </h1>
-        <GhostBtn onClick={connect}>
-  {address
-    ? `${address.slice(0, 6)}…${address.slice(-4)} · ${networkName || (chainId ?? "—")}`
-    : "Connect Wallet"}
-</GhostBtn>
-
-
-      </header>
-{chainId !== null && chainId !== SEPOLIA_ID_DEC && (
-  <div className="max-w-6xl mx-auto px-6 mt-3">
-    <div className="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <div className="font-medium">Wrong network detected</div>
-          <div className="opacity-80">
-            Connected to <span className="font-mono">{networkName || `chain ${chainId}`}</span>. Please switch to{" "}
-            <b>Sepolia (11155111)</b>.
+    <main className="min-h-screen bg-black text-white">
+      {/* Header */}
+      <header className="border-b border-white/10">
+        <div className="max-w-6xl mx-auto flex items-center justify-between px-6 py-4">
+          <div className="text-xl font-semibold tracking-wide">
+            DSRPT <span className="text-cyan-400">Depeg Cover</span>
+          </div>
+          <div className="flex items-center gap-3">
+            {address && (
+              <div className="text-xs text-white/70 hidden sm:block">
+                {networkName || (chainId ?? "—")}
+              </div>
+            )}
+            <GhostBtn onClick={connect}>
+              {address
+                ? `${address.slice(0, 6)}…${address.slice(-4)}`
+                : "Connect Wallet"}
+            </GhostBtn>
           </div>
         </div>
-        <button
-          onClick={switchToSepolia}
-          className="rounded-lg px-3 py-2 bg-cyan-400/90 text-black font-medium hover:bg-cyan-300"
-        >
-          Switch to Sepolia
-        </button>
-      </div>
-    </div>
-  </div>
-)}
+      </header>
 
-
-      <main className="max-w-6xl mx-auto px-6 pb-24">
-        {/* Top Stats */}
-        <section className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <Stat label="Network" value={chainId ? `Chain ${chainId}` : "—"} />
-          <Stat label="Fixed Premium" value={`${fmtUnits(fixedPremium, TOKEN_DECIMALS)} ${tokenSymbol}`} />
-          <Stat label="Fixed Payout" value={`${fmtUnits(fixedPayout, TOKEN_DECIMALS)} ${tokenSymbol}`} />
-          <Stat label="Pool Balance" value={`${fmtUnits(poolBal, TOKEN_DECIMALS)} ${tokenSymbol}`} />
-        </section>
-
-        {/* Address Config */}
-        <section className="mt-8 grid md:grid-cols-3 gap-6">
-          <Card title="Addresses">
-            <div className="space-y-3">
+      {/* Wrong network banner */}
+      {wrongChain && (
+        <div className="max-w-6xl mx-auto px-6 mt-3">
+          <div className="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm">
+            <div className="flex items-center justify-between gap-3">
               <div>
-                <Label>Token</Label>
-                <Input value={tokenAddr} onChange={e=>setTokenAddr(e.target.value)} />
-              </div>
-              <div>
-                <Label>Oracle</Label>
-                <Input value={oracleAddr} onChange={e=>setOracleAddr(e.target.value)} />
-              </div>
-              <div>
-                <Label>Cover</Label>
-                <Input value={coverAddr} onChange={e=>setCoverAddr(e.target.value)} />
-              </div>
-              <PrimaryBtn onClick={load}>Refresh State</PrimaryBtn>
-            </div>
-          </Card>
-
-          {/* Coverage Builder */}
-          <Card title="Coverage Builder (Linear Pricing)">
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <Label>Desired Payout ({tokenSymbol})</Label>
-                <Input value={desiredPayout} onChange={e=>setDesiredPayout(e.target.value)} placeholder="1000" />
-              </div>
-              <div>
-                <Label>Duration (days)</Label>
-                <Input type="number" min={1} value={durationDays} onChange={e=>setDurationDays(parseInt(e.target.value||"0")||0)} />
-              </div>
-            </div>
-            <div className="flex items-center justify-between mt-4">
-              <div className="text-sm opacity-80">Premium → <span className="font-medium text-cyan-300">{fmtUnits(computedPremium, TOKEN_DECIMALS)} {tokenSymbol}</span></div>
-              <div className="space-x-2">
-                <GhostBtn onClick={doApprovePremium} disabled={!address}>Approve</GhostBtn>
-                <PrimaryBtn onClick={doBuyPolicy} disabled={!address}>Buy Policy</PrimaryBtn>
-              </div>
-            </div>
-          </Card>
-
-          {/* Oracle & Trigger */}
-          <Card title="Oracle · Trigger">
-            <div className="space-y-2">
-              <div className="text-sm opacity-70">Current Oracle Price: <span className="opacity-100">{fmtUnits(oraclePrice, FEED_DECIMALS)} USD</span></div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <Label>Set Price (e.g., 0.96)</Label>
-                  <Input value={depegDisplay} onChange={e=>setDepegDisplay(e.target.value)} />
-                </div>
-                <div>
-                  <Label>Heartbeat (s)</Label>
-                  <Input disabled value={heartbeat.toString()} />
+                <div className="font-medium">Wrong network detected</div>
+                <div className="opacity-80">
+                  Connected to <span className="font-mono">{networkName || `chain ${chainId}`}</span>. Please switch to{" "}
+                  <b>Sepolia (11155111)</b>.
                 </div>
               </div>
-              <div className="flex items-center justify-between pt-2">
-                <GhostBtn onClick={doSetOracle} disabled={!address}>Set Oracle</GhostBtn>
-                <PrimaryBtn onClick={doTrigger} disabled={!address}>Trigger Payout</PrimaryBtn>
+              <PrimaryBtn onClick={switchToSepolia}>Switch to Sepolia</PrimaryBtn>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hero / Addresses */}
+      <section className="max-w-6xl mx-auto px-6 py-8">
+        <div className="grid md:grid-cols-3 gap-5">
+          <Card title="Active Contracts">
+            <div className="text-xs space-y-1 font-mono break-all">
+              <div>Token: <span className="text-cyan-300">{TOKEN}</span></div>
+              <div>Oracle: <span className="text-cyan-300">{ORACLE}</span></div>
+              <div>Cover: <span className="text-cyan-300">{COVER}</span></div>
+            </div>
+            <div className="mt-4 flex gap-2">
+              <GhostBtn onClick={readState}>Refresh State</GhostBtn>
+            </div>
+          </Card>
+
+          <Card title="Your Wallet">
+            <div className="text-sm">
+              <div className="flex items-center justify-between">
+                <div className="text-white/70">mUSD Balance</div>
+                <div className="font-mono">{fromUnits(myBal)}</div>
+              </div>
+              <div className="flex items-center justify-between mt-1">
+                <div className="text-white/70">Allowance → Cover</div>
+                <div className="font-mono">{fromUnits(allowance)}</div>
               </div>
             </div>
           </Card>
-        </section>
 
-        {/* Owner / Pool Ops + Policy View */}
-        <section className="mt-8 grid md:grid-cols-3 gap-6">
-          <Card title="Owner · Pool Funding">
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <Label>Fund Amount ({tokenSymbol})</Label>
-                <Input value={fundAmount} onChange={e=>setFundAmount(e.target.value)} />
+          <Card title="Pool / Oracle">
+            <div className="text-sm">
+              <div className="flex items-center justify-between">
+                <div className="text-white/70">Pool Balance</div>
+                <div className="font-mono">{fromUnits(poolBalance)}</div>
               </div>
-              <div>
-                <Label>Pool Cap</Label>
-                <Input disabled value={fmtUnits(poolCap, TOKEN_DECIMALS)} />
+              <div className="flex items-center justify-between mt-1">
+                <div className="text-white/70">Oracle Price</div>
+                <div className="font-mono">{oraclePrice}</div>
               </div>
             </div>
-            <div className="flex items-center justify-between mt-4">
-              <GhostBtn onClick={doApproveFunding} disabled={!address}>Approve</GhostBtn>
-              <PrimaryBtn onClick={doFundPool} disabled={!address}>Fund Pool</PrimaryBtn>
+          </Card>
+        </div>
+      </section>
+
+      {/* Coverage Builder */}
+      <section className="max-w-6xl mx-auto px-6 pb-10">
+        <div className="grid lg:grid-cols-2 gap-6">
+          <Card title="Coverage Builder">
+            <Field
+              label="Desired Payout (mUSD)"
+              value={payoutStr}
+              onChange={setPayoutStr}
+              placeholder="1000"
+              right={<div className="text-xs text-white/60 pr-1">mUSD</div>}
+              type="number"
+            />
+            <Field
+              label="Duration (seconds)"
+              value={durationSec}
+              onChange={setDurationSec}
+              placeholder="604800"
+              type="number"
+            />
+            <div className="flex items-center justify-between mt-2 text-sm">
+              <div className="text-white/70">Premium (5%)</div>
+              <div className="font-mono">{fromUnits(premiumRaw)}</div>
+            </div>
+            <div className="mt-4 flex gap-2">
+              <PrimaryBtn onClick={doApprovePremium} disabled={!address || wrongChain || premiumRaw === 0n}>
+                Approve Premium
+              </PrimaryBtn>
+              <PrimaryBtn onClick={doBuyPolicy} disabled={!address || wrongChain || premiumRaw === 0n}>
+                Buy Policy
+              </PrimaryBtn>
             </div>
           </Card>
 
-          <Card title="Your Policy">
-            <div className="space-y-2 text-sm">
-              {policy ? (
-                <>
-                  <div>Premium: <span className="font-medium">{fmtUnits(policy[0] ?? 0n, TOKEN_DECIMALS)} {tokenSymbol}</span></div>
-                  <div>Payout: <span className="font-medium">{fmtUnits(policy[1] ?? 0n, TOKEN_DECIMALS)} {tokenSymbol}</span></div>
-                  <div>Expires: <span className="font-medium">{policy[3] ? new Date(Number(policy[3])*1000).toLocaleString() : "—"}</span></div>
-                  <div>Status: <span className="font-medium">{policy[5] ? (policy[4] ? "Paid" : "Active") : "None"}</span></div>
-                </>
-              ) : (
-                <div className="opacity-70">Connect and buy a policy to see details.</div>
-              )}
+          <Card title="Owner / Oracle Controls">
+            <Field
+              label="Fund Amount (mUSD)"
+              value={fundStr}
+              onChange={setFundStr}
+              placeholder="20000"
+              type="number"
+            />
+            <div className="flex gap-2">
+              <PrimaryBtn onClick={doFundPool} disabled={!address || wrongChain}>
+                Approve & Fund Pool
+              </PrimaryBtn>
+            </div>
+
+            <div className="h-px bg-white/10 my-4" />
+
+            <Field
+              label="Oracle Price (e.g., 0.960000)"
+              value={oraclePrice}
+              onChange={setOraclePrice}
+              placeholder="0.970000"
+              type="text"
+            />
+            <div className="flex gap-2">
+              <GhostBtn onClick={doSetPrice} disabled={!address || wrongChain}>
+                Set Oracle Price
+              </GhostBtn>
+              <PrimaryBtn onClick={doTrigger} disabled={!address || wrongChain}>
+                Trigger Payout
+              </PrimaryBtn>
             </div>
           </Card>
+        </div>
+      </section>
 
-          <Card title="Theme & Diagnostics">
-            <div className="text-sm space-y-2 opacity-80">
-              <div>Connected: {address ? `${address.slice(0,6)}…${address.slice(-4)}` : "—"}</div>
-              <div>Cover Token Balance: {fmtUnits(poolBal, TOKEN_DECIMALS)} {tokenSymbol}</div>
-              <div>Paused: {paused ? "Yes" : "No"}</div>
-            </div>
-            <div className="mt-4 text-xs opacity-60">
-              <div>Tip: For demos, mint yourself tokens via your token contract if low.</div>
-              <div>Pricing: premium = fixedPremium × desiredPayout / fixedPayout</div>
-            </div>
-          </Card>
-        </section>
-      </main>
-
-      <footer className="max-w-6xl mx-auto px-6 py-8 text-center opacity-60 text-sm">
-        © {new Date().getFullYear()} DSRPT · Parametric Risk · Demo UI
+      {/* Footer */}
+      <footer className="py-8 text-center text-xs text-white/40">
+        DSRPT • Parametric USDC/USDT depeg cover • Sepolia demo
       </footer>
-    </div>
+    </main>
   );
 }
