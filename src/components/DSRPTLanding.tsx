@@ -19,7 +19,6 @@ const DEFAULTS = {
 const SEPOLIA_ID_DEC = 11155111;
 const SEPOLIA_ID_HEX = "0xaa36a7";
 const PUBLIC_RPC = process.env.NEXT_PUBLIC_SEPOLIA_RPC ?? "";
-
 const TOKEN_DECIMALS = 6n;
 
 /* -------------------------------------------------------------------------- */
@@ -69,17 +68,9 @@ function withCommas(n: string) {
   const [i, f] = n.split(".");
   return `${i.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}${f ? "." + f : ""}`;
 }
-function expiryIso(secondsFromNow: string): string {
-  const s = Number(secondsFromNow || "0");
-  if (!isFinite(s) || s <= 0) return "—";
-  const d = new Date(Date.now() + s * 1000);
-  return d.toLocaleString();
-}
 function short(addr?: string) {
   return addr ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : "";
 }
-
-/* ------------------------------- Network Guard ------------------------------- */
 
 async function ensureSepolia(): Promise<void> {
   const eth = (globalThis as any).ethereum;
@@ -158,7 +149,7 @@ function useInjected() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return { provider, signer, address, chainId, networkName, connect, switchToSepolia };
+  return { provider, signer, address, chainId, networkName, connect, switchToSepolia, refresh };
 }
 
 /* --------------------------------- UI Prims -------------------------------- */
@@ -213,7 +204,7 @@ const Field: React.FC<{
 /* -------------------------------- COMPONENT -------------------------------- */
 
 export default function DSRPTLanding() {
-  const { provider, signer, address, chainId, networkName, connect, switchToSepolia } = useInjected();
+  const { provider, signer, address, chainId, networkName, connect, switchToSepolia, refresh } = useInjected();
 
   // Addrs
   const TOKEN = DEFAULTS.token;
@@ -245,6 +236,7 @@ export default function DSRPTLanding() {
   // Derived
   const payoutRaw = useMemo(() => parseUnits6(payoutStr) ?? 0n, [payoutStr]);
   const premiumRaw = useMemo(() => (payoutRaw * BigInt(premiumBps)) / 10000n, [payoutRaw, premiumBps]);
+  const premiumHuman = withCommas(formatUnits6(premiumRaw));
 
   // Contracts
   const token = useMemo(() => (signer ? new ethers.Contract(TOKEN, ERC20_ABI, signer) : null), [signer, TOKEN]);
@@ -294,6 +286,273 @@ export default function DSRPTLanding() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider, address]);
 
-  // countdown
+  // countdown display (FIXED)
   useEffect(() => {
-    if (!policyActive || !policyExpiry
+    if (!policyActive || !policyExpiry) {
+      setCountdown("—");
+      return;
+    }
+    const id = setInterval(() => {
+      const now = Math.floor(Date.now() / 1000);
+      const diff = Math.max(0, policyExpiry - now);
+      const h = Math.floor(diff / 3600);
+      const m = Math.floor((diff % 3600) / 60);
+      const s = diff % 60;
+      setCountdown(`${h}h ${m}m ${s}s`);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [policyActive, policyExpiry]);
+
+  /* --------------------------------- Actions -------------------------------- */
+
+  const requireWallet = () => {
+    if (!signer) throw new Error("Connect wallet first");
+    if (wrongChain) throw new Error("Wrong network. Switch to Sepolia.");
+  };
+
+  const handleMintDemo = async () => {
+    try {
+      requireWallet();
+      setBusy("Minting 10,000 mUSD");
+      setErr("");
+      if (!token || !address) throw new Error("Token not ready");
+      const amt = 10_000n * 10n ** TOKEN_DECIMALS; // 10k mUSD
+      const tx = await token.mint(address, amt);
+      await tx.wait();
+      await readAll();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const handleFund = async () => {
+    try {
+      requireWallet();
+      setBusy("Funding pool");
+      setErr("");
+      if (!token || !cover || !address) throw new Error("Contracts not ready");
+      const amt = parseUnits6(fundStr);
+      if (amt === null) throw new Error("Invalid fund amount");
+      const alw = (await token.allowance(address, COVER)) as bigint;
+      if (alw < amt) {
+        const txA = await token.approve(COVER, amt);
+        await txA.wait();
+      }
+      const tx = await cover.fundPool(amt);
+      await tx.wait();
+      await readAll();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const handleBuy = async () => {
+    try {
+      requireWallet();
+      setBusy("Buying policy");
+      setErr("");
+      if (!token || !cover || !address) throw new Error("Contracts not ready");
+      const dur = Number(durationSec);
+      if (!isFinite(dur) || dur <= 0) throw new Error("Bad duration");
+      if (payoutRaw <= 0) throw new Error("Bad payout");
+      const need = premiumRaw;
+      const alw = (await token.allowance(address, COVER)) as bigint;
+      if (alw < need) {
+        const txA = await token.approve(COVER, need);
+        await txA.wait();
+      }
+      const tx = await cover.buyPolicy(dur, payoutRaw);
+      await tx.wait();
+      await readAll();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const handleTrigger = async () => {
+    try {
+      requireWallet();
+      setBusy("Triggering payout");
+      setErr("");
+      if (!cover || !address) throw new Error("Cover not ready");
+      const tx = await cover.triggerAndPayout(address);
+      await tx.wait();
+      await readAll();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const handleSetPrice = async () => {
+    try {
+      requireWallet();
+      setBusy("Setting oracle price");
+      setErr("");
+      if (!oracle) throw new Error("Oracle not ready");
+      const n = Number(priceStr);
+      if (!isFinite(n)) throw new Error("Bad price");
+      const raw = Math.round(n * 1e8); // 8-dec oracle
+      const tx = await oracle.setPrice(raw);
+      await tx.wait();
+      await readAll();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /* ----------------------------------- UI ---------------------------------- */
+
+  return (
+    <div className="min-h-screen text-white relative overflow-hidden">
+      {/* neon background */}
+      <div className="pointer-events-none absolute inset-0 -z-10">
+        <div className="absolute -top-40 -left-32 w-[40rem] h-[40rem] rounded-full bg-cyan-500/20 blur-3xl" />
+        <div className="absolute -bottom-40 -right-32 w-[40rem] h-[40rem] rounded-full bg-fuchsia-500/10 blur-3xl" />
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_20%,#0ea5e94d,transparent_40%),radial-gradient(circle_at_80%_50%,#a21caf33,transparent_35%)]" />
+      </div>
+
+      <header className="max-w-6xl mx-auto px-6 py-6 flex items-center justify-between">
+        <div className="text-xl font-bold tracking-wide">DSRPT • Depeg Cover</div>
+        <div className="flex gap-2">
+          <Button variant="ghost" onClick={refresh}>Refresh</Button>
+          {chainId === SEPOLIA_ID_DEC ? (
+            <span className="px-3 py-2 rounded-xl border border-emerald-400/40 text-emerald-300">
+              {networkName || "sepolia"}
+            </span>
+          ) : (
+            <Button onClick={switchToSepolia}>Switch to Sepolia</Button>
+          )}
+          {address ? (
+            <span className="px-3 py-2 rounded-xl border border-white/10">{short(address)}</span>
+          ) : (
+            <Button onClick={connect}>Connect</Button>
+          )}
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto px-6 pb-20">
+        {err && (
+          <div className="mb-4 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm">
+            ⚠ {err}
+          </div>
+        )}
+        {busy && (
+          <div className="mb-4 rounded-xl border border-cyan-400/40 bg-cyan-400/10 px-4 py-3 text-sm">
+            ⏳ {busy}…
+          </div>
+        )}
+
+        <div className="grid md:grid-cols-3 gap-5">
+          <Card title="Wallet">
+            <div className="text-sm mb-2">Token: {DEFAULTS.token}</div>
+            <div className="text-sm mb-4">Cover: {DEFAULTS.cover}</div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <div className="text-white/60 text-xs mb-1">Your mUSD</div>
+                <div className="text-lg font-semibold">
+                  {withCommas(formatUnits6(myBal))}
+                </div>
+              </div>
+              <div>
+                <div className="text-white/60 text-xs mb-1">Pool mUSD</div>
+                <div className="text-lg font-semibold">
+                  {withCommas(formatUnits6(poolBalance))}
+                </div>
+              </div>
+            </div>
+            <div className="mt-4 flex gap-2">
+              <Button onClick={handleMintDemo}>Mint 10k mUSD</Button>
+              <Button variant="ghost" onClick={readAll}>Sync</Button>
+            </div>
+          </Card>
+
+          <Card title="Policy Builder">
+            <Field
+              label="Payout (mUSD)"
+              value={payoutStr}
+              onChange={setPayoutStr}
+              right={<span className="text-white/60 text-sm">≈ Premium {premiumHuman} mUSD @ {premiumBps / 100}%</span>}
+            />
+            <Field
+              label="Duration (seconds)"
+              value={durationSec}
+              onChange={setDurationSec}
+              placeholder="604800"
+            />
+            <div className="flex gap-2">
+              <Button onClick={handleBuy} disabled={!address || wrongChain}>
+                Buy Policy
+              </Button>
+              <Button variant="ghost" onClick={() => { setPayoutStr("1000"); setDurationSec("604800"); }}>
+                Reset
+              </Button>
+            </div>
+
+            {/* Policy Preview */}
+            <div className="mt-4 rounded-xl border border-white/10 bg-white/[0.04] p-3">
+              <div className="text-xs text-white/60 mb-1">Preview</div>
+              <div className="text-sm">
+                <div>Premium: <span className="font-semibold">{premiumHuman} mUSD</span></div>
+                <div>Payout: <span className="font-semibold">{withCommas(formatUnits6(payoutRaw))} mUSD</span></div>
+                <div>Time left: <span className="font-semibold">{countdown}</span></div>
+              </div>
+            </div>
+          </Card>
+
+          <Card title="Oracle & Triggers">
+            <Field
+              label="Oracle Price (USD)"
+              value={priceStr}
+              onChange={setPriceStr}
+              right={<span className="text-white/60 text-sm">live: {oraclePrice}</span>}
+            />
+            <div className="flex gap-2 mb-4">
+              <Button onClick={handleSetPrice}>Set Price</Button>
+              <Button variant="danger" onClick={handleTrigger}>Trigger Payout</Button>
+            </div>
+            <div className="text-sm grid gap-1">
+              <div>Active: <span className="font-semibold">{policyActive ? "Yes" : "No"}</span></div>
+              <div>My payout: <span className="font-semibold">{withCommas(formatUnits6(policyPayout))} mUSD</span></div>
+              <div>Expiry: <span className="font-semibold">{policyExpiry ? new Date(policyExpiry * 1000).toLocaleString() : "—"}</span></div>
+              <div>Time left: <span className="font-semibold">{countdown}</span></div>
+            </div>
+          </Card>
+        </div>
+
+        <div className="grid md:grid-cols-3 gap-5 mt-5">
+          <Card title="Fund Pool">
+            <Field label="Amount (mUSD)" value={fundStr} onChange={setFundStr} />
+            <Button onClick={handleFund}>Approve & Fund</Button>
+            <div className="text-xs text-white/60 mt-2">
+              Allowance: {withCommas(formatUnits6(allowance))} mUSD
+            </div>
+          </Card>
+
+          <Card title="Network">
+            <div className="text-sm mb-3">Current: <span className="font-semibold">{networkName || "—"}</span></div>
+            <div className="flex gap-2">
+              <Button onClick={switchToSepolia}>Switch/Add Sepolia</Button>
+              <Button variant="ghost" onClick={connect}>Reconnect</Button>
+            </div>
+          </Card>
+
+          <Card title="About">
+            <div className="text-sm leading-relaxed">
+              Parametric depeg cover for stablecoins. Premium = payout × bps / 10,000. Demo oracle has 8 decimals.
+            </div>
+          </Card>
+        </div>
+      </main>
+    </div>
+  );
+}
