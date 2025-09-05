@@ -18,10 +18,9 @@ const DEFAULTS = {
 
 const SEPOLIA_ID_DEC = 11155111;
 const SEPOLIA_ID_HEX = "0xaa36a7";
-const PUBLIC_RPC = process.env.NEXT_PUBLIC_SEPOLIA_RPC ?? ""; // used when adding chain
+const PUBLIC_RPC = process.env.NEXT_PUBLIC_SEPOLIA_RPC ?? "";
 
-const TOKEN_DECIMALS = 6n; // MockUSD = 6
-const PREMIUM_BPS = 500n; // 5% of payout
+const TOKEN_DECIMALS = 6n;
 
 /* -------------------------------------------------------------------------- */
 /*                                     ABIs                                   */
@@ -34,7 +33,7 @@ const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
   "function approve(address,uint256) returns (bool)",
   "function allowance(address owner,address spender) view returns (uint256)",
-  "function mint(address,uint256)", // mock
+  "function mint(address,uint256)",
 ] as const;
 
 const ORACLE_ABI = [
@@ -44,41 +43,40 @@ const ORACLE_ABI = [
 
 const COVER_ABI = [
   "function fundPool(uint256) external",
-  "function buyPolicy(uint64) external",
+  "function buyPolicy(uint64,uint256) external",
   "function triggerAndPayout(address) external",
-  // Optional view; your solidity may include this:
   "function poolBalance() view returns (uint256)",
+  "function premiumBps() view returns (uint16)",
+  "function policies(address) view returns (uint64 expiry, uint256 payout, bool active)",
 ] as const;
 
 /* -------------------------------------------------------------------------- */
 /*                                   HELPERS                                  */
 /* -------------------------------------------------------------------------- */
 
-function numToRaw6(v: string): bigint | null {
-  if (!v?.trim()) return 0n;
-  if (!isFinite(Number(v))) return null;
-  const [i, f = ""] = v.split(".");
+function parseUnits6(human: string): bigint | null {
+  if (!human?.trim()) return 0n;
+  if (!isFinite(Number(human))) return null;
+  const [i, f = ""] = human.split(".");
   const frac = (f + "000000").slice(0, 6);
   return BigInt(i || "0") * 10n ** TOKEN_DECIMALS + BigInt(frac || "0");
 }
-function fromRaw6(x?: bigint) {
-  if (x === undefined || x === null) return "-";
-  return ethers.formatUnits(x, Number(TOKEN_DECIMALS));
+function formatUnits6(raw?: bigint) {
+  if (raw === undefined || raw === null) return "-";
+  return ethers.formatUnits(raw, Number(TOKEN_DECIMALS));
 }
 function withCommas(n: string) {
   const [i, f] = n.split(".");
   return `${i.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}${f ? "." + f : ""}`;
 }
-function secToExpiryISO(seconds: string): string {
-  const s = Number(seconds || "0");
+function expiryIso(secondsFromNow: string): string {
+  const s = Number(secondsFromNow || "0");
   if (!isFinite(s) || s <= 0) return "—";
   const d = new Date(Date.now() + s * 1000);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(
-    2,
-    "0"
-  )} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(
-    d.getSeconds()
-  ).padStart(2, "0")}`;
+  return d.toLocaleString();
+}
+function short(addr?: string) {
+  return addr ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : "";
 }
 
 /* ------------------------------- Network Guard ------------------------------- */
@@ -86,7 +84,6 @@ function secToExpiryISO(seconds: string): string {
 async function ensureSepolia(): Promise<void> {
   const eth = (globalThis as any).ethereum;
   if (!eth) throw new Error("No injected wallet found");
-
   try {
     await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: SEPOLIA_ID_HEX }] });
   } catch (err: any) {
@@ -164,29 +161,28 @@ function useInjected() {
   return { provider, signer, address, chainId, networkName, connect, switchToSepolia };
 }
 
-/* --------------------------------- UI Bits --------------------------------- */
+/* --------------------------------- UI Prims -------------------------------- */
 
-type BtnProps = React.ButtonHTMLAttributes<HTMLButtonElement> & { className?: string };
-const GhostBtn: React.FC<BtnProps> = ({ className = "", ...p }) => (
-  <button
-    {...p}
-    className={`px-3 py-2 rounded-xl border border-white/20 hover:bg-white/10 transition disabled:opacity-50 ${className}`}
-  />
-);
-const PrimaryBtn: React.FC<BtnProps> = ({ className = "", ...p }) => (
-  <button
-    {...p}
-    className={`px-3 py-2 rounded-xl bg-cyan-400 text-black font-semibold hover:bg-cyan-300 disabled:opacity-50 ${className}`}
-  />
-);
+type BtnProps = React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "ghost" | "danger" };
+const Button: React.FC<BtnProps> = ({ variant = "primary", className = "", ...p }) => {
+  const base =
+    "px-3 py-2 rounded-xl transition font-semibold disabled:opacity-50 active:scale-[0.99] outline-none";
+  const styles =
+    variant === "primary"
+      ? "bg-cyan-400 text-black hover:bg-cyan-300 shadow-[0_0_20px_#22d3ee55]"
+      : variant === "danger"
+      ? "bg-rose-500 text-white hover:bg-rose-400 shadow-[0_0_20px_#f43f5e55]"
+      : "border border-white/20 hover:bg-white/10 text-white";
+  return <button {...p} className={`${base} ${styles} ${className}`} />;
+};
 
 const Card: React.FC<{ title: string; children: React.ReactNode; className?: string }> = ({
   title,
   children,
   className = "",
 }) => (
-  <div className={`rounded-2xl border border-white/10 bg-white/[0.03] p-5 ${className}`}>
-    <div className="text-sm uppercase tracking-wide text-white/60 mb-2">{title}</div>
+  <div className={`rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur p-5 ${className}`}>
+    <div className="text-xs uppercase tracking-wide text-white/60 mb-2">{title}</div>
     {children}
   </div>
 );
@@ -219,28 +215,36 @@ const Field: React.FC<{
 export default function DSRPTLanding() {
   const { provider, signer, address, chainId, networkName, connect, switchToSepolia } = useInjected();
 
-  // Addresses (env overrides supported)
+  // Addrs
   const TOKEN = DEFAULTS.token;
   const ORACLE = DEFAULTS.oracle;
   const COVER = DEFAULTS.cover;
 
-  // Local state
+  // State
   const [poolBalance, setPoolBalance] = useState<bigint>(0n);
   const [myBal, setMyBal] = useState<bigint>(0n);
   const [allowance, setAllowance] = useState<bigint>(0n);
-  const [oraclePrice, setOraclePrice] = useState<string>("1.000000"); // human
+  const [premiumBps, setPremiumBps] = useState<number>(5); // live from chain
+  const [oraclePrice, setOraclePrice] = useState<string>("1.000000");
+
   const [payoutStr, setPayoutStr] = useState<string>("1000");
   const [durationSec, setDurationSec] = useState<string>("604800");
-  const [fundStr, setFundStr] = useState<string>("20000");
+  const [fundStr, setFundStr] = useState<string>("10000");
+  const [priceStr, setPriceStr] = useState<string>("0.960000");
 
-  // UX
-  const [busy, setBusy] = useState<string>(""); // which action is in-flight
-  const [err, setErr] = useState<string>(""); // last human-readable error
+  const [policyActive, setPolicyActive] = useState<boolean>(false);
+  const [policyPayout, setPolicyPayout] = useState<bigint>(0n);
+  const [policyExpiry, setPolicyExpiry] = useState<number>(0);
+  const [countdown, setCountdown] = useState<string>("—");
+
+  const [busy, setBusy] = useState<string>("");
+  const [err, setErr] = useState<string>("");
+
   const wrongChain = chainId !== null && chainId !== SEPOLIA_ID_DEC;
 
   // Derived
-  const payoutRaw = useMemo(() => numToRaw6(payoutStr) ?? 0n, [payoutStr]);
-  const premiumRaw = useMemo(() => (payoutRaw * PREMIUM_BPS) / 10000n, [payoutRaw]);
+  const payoutRaw = useMemo(() => parseUnits6(payoutStr) ?? 0n, [payoutStr]);
+  const premiumRaw = useMemo(() => (payoutRaw * BigInt(premiumBps)) / 10000n, [payoutRaw, premiumBps]);
 
   // Contracts
   const token = useMemo(() => (signer ? new ethers.Contract(TOKEN, ERC20_ABI, signer) : null), [signer, TOKEN]);
@@ -249,7 +253,7 @@ export default function DSRPTLanding() {
 
   /* --------------------------------- Reads --------------------------------- */
 
-  const readState = async () => {
+  const readAll = async () => {
     setErr("");
     try {
       if (provider && address) {
@@ -259,336 +263,37 @@ export default function DSRPTLanding() {
         setMyBal(bal);
         setAllowance(alw);
       }
-    } catch (e: any) {
-      // ignore
-    }
+    } catch {}
     try {
       const cov = new ethers.Contract(COVER, COVER_ABI, provider ?? undefined);
       if ((cov as any).poolBalance) {
         const pb = (await cov.poolBalance()) as bigint;
         setPoolBalance(pb);
       }
-    } catch {
-      // optional
-    }
+      if ((cov as any).premiumBps) {
+        const b = (await cov.premiumBps()) as number;
+        setPremiumBps(Number(b));
+      }
+      if (address && (cov as any).policies) {
+        const [exp, pay, act] = (await cov.policies(address)) as [bigint, bigint, boolean];
+        setPolicyActive(act);
+        setPolicyPayout(pay);
+        setPolicyExpiry(Number(exp));
+      }
+    } catch {}
     try {
       const orc = new ethers.Contract(ORACLE, ORACLE_ABI, provider ?? undefined);
       const [, answer] = (await orc.latestRoundData()) as [bigint, bigint, bigint, bigint, bigint];
-      const scaled = Number(answer) / 1e8; // assume 8 decimals chainlink-style
+      const scaled = Number(answer) / 1e8; // demo oracle: 8 decimals
       setOraclePrice(isFinite(scaled) ? scaled.toFixed(6) : "—");
-    } catch {
-      // ignore
-    }
+    } catch {}
   };
 
   useEffect(() => {
-    if (provider && address) readState();
+    if (provider) readAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider, address]);
 
-  /* -------------------------------- Actions -------------------------------- */
-
-  async function guardReady() {
-    if (!address) throw new Error("Connect your wallet first.");
-    if (wrongChain) throw new Error("Wrong network. Please switch to Sepolia.");
-    if (!signer) throw new Error("No signer available.");
-  }
-
-  const doApprovePremium = async () => {
-    try {
-      await guardReady();
-      if (!token) throw new Error("Token not set");
-      if (premiumRaw <= 0n) throw new Error("Premium must be > 0");
-      setBusy("approve-premium");
-      const tx = await token.approve(COVER, premiumRaw);
-      await tx.wait?.();
-      await readState();
-    } catch (e: any) {
-      setErr(e?.message || "Approve failed");
-    } finally {
-      setBusy("");
-    }
-  };
-
-  const doBuyPolicy = async () => {
-    try {
-      await guardReady();
-      if (!cover || !token) throw new Error("Contracts not ready");
-      if (premiumRaw <= 0n) throw new Error("Premium must be > 0");
-      // Auto-approve if allowance is short
-      if (allowance < premiumRaw) {
-        setBusy("approve-premium-auto");
-        const txA = await token.approve(COVER, premiumRaw);
-        await txA.wait?.();
-        await readState();
-      }
-      const dur = BigInt(durationSec || "0");
-      if (dur <= 0n) throw new Error("Duration must be > 0");
-      setBusy("buy");
-      const tx = await cover.buyPolicy(Number(dur)); // uint64 OK
-      await tx.wait?.();
-      await readState();
-    } catch (e: any) {
-      setErr(e?.message || "Buy policy failed");
-    } finally {
-      setBusy("");
-    }
-  };
-
-  const doFundPool = async () => {
-    try {
-      await guardReady();
-      if (!cover || !token) throw new Error("Contracts not ready");
-      const amt = numToRaw6(fundStr) ?? 0n;
-      if (amt <= 0n) throw new Error("Fund amount must be > 0");
-      setBusy("approve-fund");
-      const txA = await token.approve(COVER, amt);
-      await txA.wait?.();
-      setBusy("fund");
-      const txF = await cover.fundPool(amt);
-      await txF.wait?.();
-      await readState();
-    } catch (e: any) {
-      setErr(e?.message || "Funding failed");
-    } finally {
-      setBusy("");
-    }
-  };
-
-  const doSetPrice = async () => {
-    try {
-      await guardReady();
-      if (!oracle) throw new Error("Oracle not set");
-      const [i, f = ""] = oraclePrice.split(".");
-      const pad = (f + "00000000").slice(0, 8);
-      const raw = BigInt(`${i || "0"}${pad}`);
-      setBusy("price");
-      const tx = await oracle.setPrice(raw);
-      await tx.wait?.();
-      await readState();
-    } catch (e: any) {
-      setErr(e?.message || "Set price failed");
-    } finally {
-      setBusy("");
-    }
-  };
-
-  const doTrigger = async () => {
-    try {
-      await guardReady();
-      if (!cover) throw new Error("Cover not set");
-      setBusy("trigger");
-      const tx = await cover.triggerAndPayout(address);
-      await tx.wait?.();
-      await readState();
-    } catch (e: any) {
-      setErr(e?.message || "Trigger failed");
-    } finally {
-      setBusy("");
-    }
-  };
-
-  /* ---------------------------------- UI ---------------------------------- */
-
-  return (
-    <main className="min-h-screen bg-black text-white">
-      {/* Header */}
-      <header className="border-b border-white/10">
-        <div className="max-w-6xl mx-auto flex items-center justify-between px-6 py-4">
-          <div className="text-xl font-semibold tracking-wide">
-            DSRPT <span className="text-cyan-400">Depeg Cover</span>
-          </div>
-          <div className="flex items-center gap-3">
-            {address && <div className="text-xs text-white/70 hidden sm:block">{networkName}</div>}
-            <GhostBtn onClick={connect}>{address ? `${address.slice(0, 6)}…${address.slice(-4)}` : "Connect Wallet"}</GhostBtn>
-          </div>
-        </div>
-      </header>
-
-      {/* Wrong network */}
-      {chainId !== null && chainId !== SEPOLIA_ID_DEC && (
-        <div className="max-w-6xl mx-auto px-6 mt-3">
-          <div className="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="font-medium">Wrong network detected</div>
-                <div className="opacity-80">
-                  Connected to <span className="font-mono">{networkName || `chain ${chainId}`}</span>. Please switch to{" "}
-                  <b>Sepolia (11155111)</b>.
-                </div>
-              </div>
-              <PrimaryBtn onClick={switchToSepolia}>Switch to Sepolia</PrimaryBtn>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Error / Status */}
-      <div className="max-w-6xl mx-auto px-6 mt-3 space-y-2">
-        {busy && (
-          <div className="rounded-lg border border-cyan-400/30 bg-cyan-400/10 px-3 py-2 text-sm">
-            <span className="font-medium">Working:</span> {busy}
-          </div>
-        )}
-        {err && (
-          <div className="rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-2 text-sm">
-            <span className="font-medium">Error:</span> {err}
-          </div>
-        )}
-      </div>
-
-      {/* Top cards */}
-      <section className="max-w-6xl mx-auto px-6 py-8">
-        <div className="grid md:grid-cols-3 gap-5">
-          <Card title="Active Contracts">
-            <div className="text-xs space-y-1 font-mono break-all">
-              <div>Token: <span className="text-cyan-300">{TOKEN}</span></div>
-              <div>Oracle: <span className="text-cyan-300">{ORACLE}</span></div>
-              <div>Cover: <span className="text-cyan-300">{COVER}</span></div>
-            </div>
-            <div className="mt-4 flex gap-2">
-              <GhostBtn onClick={readState}>Refresh State</GhostBtn>
-            </div>
-          </Card>
-
-          <Card title="Your Wallet">
-            <div className="text-sm">
-              <div className="flex items-center justify-between">
-                <div className="text-white/70">mUSD Balance</div>
-                <div className="font-mono">{withCommas(fromRaw6(myBal))}</div>
-              </div>
-              <div className="flex items-center justify-between mt-1">
-                <div className="text-white/70">Allowance → Cover</div>
-                <div className="font-mono">{withCommas(fromRaw6(allowance))}</div>
-              </div>
-            </div>
-          </Card>
-
-          <Card title="Pool / Oracle">
-            <div className="text-sm">
-              <div className="flex items-center justify-between">
-                <div className="text-white/70">Pool Balance</div>
-                <div className="font-mono">{withCommas(fromRaw6(poolBalance))}</div>
-              </div>
-              <div className="flex items-center justify-between mt-1">
-                <div className="text-white/70">Oracle Price</div>
-                <div className="font-mono">{oraclePrice}</div>
-              </div>
-            </div>
-          </Card>
-        </div>
-      </section>
-
-      {/* Coverage Builder + Policy Preview + Owner Controls */}
-      <section className="max-w-6xl mx-auto px-6 pb-10">
-        <div className="grid lg:grid-cols-3 gap-6">
-          {/* Builder */}
-          <div className="lg:col-span-2">
-            <Card title="Coverage Builder">
-              <Field
-                label="Desired Payout (mUSD)"
-                value={payoutStr}
-                onChange={setPayoutStr}
-                placeholder="1000"
-                right={<div className="text-xs text-white/60 pr-1">mUSD</div>}
-                type="number"
-              />
-              <Field
-                label="Duration (seconds)"
-                value={durationSec}
-                onChange={setDurationSec}
-                placeholder="604800"
-                type="number"
-              />
-              <div className="flex items-center justify-between mt-2 text-sm">
-                <div className="text-white/70">Premium (5%)</div>
-                <div className="font-mono">{withCommas(fromRaw6(premiumRaw))}</div>
-              </div>
-              <div className="mt-4 flex gap-2">
-                <PrimaryBtn onClick={doApprovePremium} disabled={!address || wrongChain || premiumRaw === 0n || !!busy}>
-                  {busy === "approve-premium" ? "Approving…" : "Approve Premium"}
-                </PrimaryBtn>
-                <PrimaryBtn
-                  onClick={doBuyPolicy}
-                  disabled={!address || wrongChain || premiumRaw === 0n || !!busy}
-                >
-                  {busy?.startsWith("approve-premium-auto") || busy === "buy" ? "Buying…" : "Buy Policy"}
-                </PrimaryBtn>
-              </div>
-            </Card>
-          </div>
-
-          {/* Policy Preview */}
-          <Card title="Policy Preview">
-            <div className="space-y-3 text-sm">
-              <div className="flex items-center justify-between">
-                <span className="text-white/70">Payout</span>
-                <span className="font-mono">{withCommas(fromRaw6(payoutRaw))}</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-white/70">Premium (5%)</span>
-                <span className="font-mono">{withCommas(fromRaw6(premiumRaw))}</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-white/70">Duration</span>
-                <span className="font-mono">
-                  {Number(durationSec || "0") > 0 ? `${Number(durationSec)}s` : "—"}
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-white/70">Est. Expiry (local)</span>
-                <span className="font-mono">{secToExpiryISO(durationSec)}</span>
-              </div>
-              <div className="h-px bg-white/10" />
-              <div className="text-xs text-white/60">
-                Parametric cover: if the oracle price drops below the threshold during your coverage window, payout equals
-                the selected amount.
-              </div>
-            </div>
-          </Card>
-        </div>
-
-        {/* Owner / Oracle Controls */}
-        <div className="grid lg:grid-cols-2 gap-6 mt-6">
-          <Card title="Pool Funding">
-            <Field
-              label="Fund Amount (mUSD)"
-              value={fundStr}
-              onChange={setFundStr}
-              placeholder="20000"
-              type="number"
-            />
-            <div className="flex gap-2">
-              <PrimaryBtn onClick={doFundPool} disabled={!address || wrongChain || !!busy}>
-                {busy === "approve-fund" || busy === "fund" ? "Funding…" : "Approve & Fund Pool"}
-              </PrimaryBtn>
-            </div>
-          </Card>
-
-          <Card title="Oracle / Payout">
-            <Field
-              label="Oracle Price (e.g., 0.960000)"
-              value={oraclePrice}
-              onChange={setOraclePrice}
-              placeholder="0.970000"
-              type="text"
-            />
-            <div className="flex gap-2">
-              <GhostBtn onClick={doSetPrice} disabled={!address || wrongChain || !!busy}>
-                {busy === "price" ? "Setting…" : "Set Oracle Price"}
-              </GhostBtn>
-              <PrimaryBtn onClick={doTrigger} disabled={!address || wrongChain || !!busy}>
-                {busy === "trigger" ? "Triggering…" : "Trigger Payout"}
-              </PrimaryBtn>
-            </div>
-          </Card>
-        </div>
-      </section>
-
-      {/* Footer */}
-      <footer className="py-8 text-center text-xs text-white/40">
-        DSRPT • Parametric USDC/USDT depeg cover • Sepolia demo
-      </footer>
-    </main>
-  );
-}
+  // countdown
+  useEffect(() => {
+    if (!policyActive || !policyExpiry
