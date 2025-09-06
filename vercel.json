@@ -1,5 +1,0 @@
-{
-  "redirects": [
-    { "source": "/", "destination": "/quote", "permanent": false }
-  ]
-}
