@@ -1,26 +1,64 @@
-/* @tailwind base; */
-/* @tailwind components; */
-/* @tailwind utilities; */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
-/* === Optional extra global styling for DSRPT landing === */
+:root {
+  --dsrpt-cyan: #22d3ee;
+  --dsrpt-fuchsia: #e879f9;
+}
+* { text-rendering: optimizeLegibility; }
+html, body { height: 100%; background: #07080c; }
 
-/* Smooth font rendering */
-html, body {
-  @apply bg-black text-white antialiased;
+body::before, body::after {
+  content: "";
+  position: fixed; inset: -20%;
+  pointer-events: none; z-index: -2;
+  background:
+    radial-gradient(60rem 60rem at 20% 15%, color-mix(in oklab, var(--dsrpt-cyan) 40%, transparent), transparent 60%),
+    radial-gradient(55rem 55rem at 85% 70%, color-mix(in oklab, var(--dsrpt-fuchsia) 30%, transparent), transparent 55%);
+  filter: blur(30px);
+}
+body::after {
+  background: radial-gradient(1200px 1200px at 50% 100%,
+    color-mix(in oklab, white 6%, transparent), transparent 60%);
+  z-index: -3; opacity: .3;
 }
 
-/* Scrollbar (futuristic sleek) */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+/* Animated grid overlay (subtle) */
+.dsrpt-grid {
+  position: fixed; inset: 0; pointer-events: none; z-index: -1;
+  background:
+    linear-gradient(to right, rgba(255,255,255,.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255,255,255,.05) 1px, transparent 1px);
+  background-size: 40px 40px;
+  mask: radial-gradient(circle at 50% 50%, rgba(0,0,0,.8), transparent 70%);
+  animation: gridShift 40s linear infinite;
 }
-::-webkit-scrollbar-track {
-  background: #0a0a0a;
+@keyframes gridShift {
+  0% { background-position: 0 0, 0 0; }
+  100% { background-position: 200px 200px, 200px 200px; }
 }
-::-webkit-scrollbar-thumb {
-  background: #2dd4bf; /* cyan-400 */
-  border-radius: 4px;
+
+/* Cards */
+.glass {
+  @apply rounded-3xl border border-white/10 bg-white/[0.035] backdrop-blur-xl;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: #22d3ee; /* lighter cyan */
+.glass-hover { transition: transform .2s ease, box-shadow .2s ease; }
+.glass-hover:hover { transform: translateY(-1px); box-shadow: 0 0 40px #22d3ee22; }
+
+/* Typography */
+.font-sans { font-family: var(--font-inter), ui-sans-serif, system-ui; }
+.font-display { font-family: var(--font-orbitron), ui-sans-serif, system-ui; letter-spacing: .02em; }
+
+/* Buttons */
+.btn { @apply px-4 py-2 rounded-2xl font-semibold transition active:scale-[0.99] disabled:opacity-50; }
+.btn-primary { @apply text-black; background: var(--dsrpt-cyan); box-shadow: 0 0 24px #22d3ee55; }
+.btn-ghost { @apply border border-white/15 text-white hover:bg-white/10; }
+.btn-accent { color: #000; background: var(--dsrpt-fuchsia); box-shadow: 0 0 24px #e879f955; }
+.btn-danger { @apply text-white; background: #f43f5e; box-shadow: 0 0 20px #f43f5e55; }
+
+/* Inputs */
+.input {
+  @apply w-full rounded-xl bg-white/5 border border-white/10 px-3 py-2 outline-none focus:border-cyan-400;
 }
+.kbd { @apply rounded-md border border-white/20 bg-white/10 px-1.5 py-0.5 text-[11px]; }
