@@ -1,0 +1,9 @@
+/* Tailwind base if you're using Tailwind */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Your global styles */
+html, body {
+  height: 100%;
+}
