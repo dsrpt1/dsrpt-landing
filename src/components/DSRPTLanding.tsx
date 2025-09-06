@@ -12,9 +12,11 @@ const DEFAULTS = {
     "0x112B36dB8d5e0Ab86174E71737d64A51591A6868") as `0x${string}`,
   oracle: (process.env.NEXT_PUBLIC_ORACLE ??
     "0x67dC9b9B24f89930D13fB72b28EE898369D5349B") as `0x${string}`,
+  // ⬇️ fallback was the V1 address; change to V2:
   cover: (process.env.NEXT_PUBLIC_COVER ??
-    "0x34f6bCE92A6E1c142B7089Ae66Be62CFdc9A3e8B") as `0x${string}`,
+    "0x8B12F6eD2E37277F9F9BF4d48931fBe57616CA57") as `0x${string}`,
 };
+
 
 const SEPOLIA_ID_DEC = 11155111;
 const SEPOLIA_ID_HEX = "0xaa36a7";
@@ -351,29 +353,47 @@ export default function DSRPTLanding() {
   };
 
   const handleBuy = async () => {
-    try {
-      requireWallet();
-      setBusy("Buying policy");
-      setErr("");
-      if (!token || !cover || !address) throw new Error("Contracts not ready");
-      const dur = Number(durationSec);
-      if (!isFinite(dur) || dur <= 0) throw new Error("Bad duration");
-      if (payoutRaw <= 0) throw new Error("Bad payout");
-      const need = premiumRaw;
-      const alw = (await token.allowance(address, COVER)) as bigint;
-      if (alw < need) {
-        const txA = await token.approve(COVER, need);
-        await txA.wait();
-      }
-      const tx = await cover.buyPolicy(dur, payoutRaw);
-      await tx.wait();
-      await readAll();
-    } catch (e: any) {
-      setErr(e?.message ?? String(e));
-    } finally {
-      setBusy("");
+  try {
+    requireWallet();
+    setBusy("Buying policy");
+    setErr("");
+    if (!token || !cover || !address) throw new Error("Contracts not ready");
+
+    const dur = Number(durationSec);
+    if (!isFinite(dur) || dur <= 0) throw new Error("Bad duration");
+
+    // Pull live state for pre-checks
+    const [pool, bps, policy, bal, alw] = await Promise.all([
+      cover.poolBalance(),
+      cover.premiumBps(),
+      cover.policies(address),
+      token.balanceOf(address),
+      token.allowance(address, COVER),
+    ]);
+
+    const payout = payoutRaw;
+    if (payout <= 0n) throw new Error("Bad payout");
+    if (policy[2] === true) throw new Error("You already have an active policy");
+    if (payout >= (pool as bigint)) throw new Error("Payout must be less than available pool");
+
+    const premium = (payout * BigInt(bps as number)) / 10000n;
+    if ((bal as bigint) < premium) throw new Error(`Insufficient balance: need ${ethers.formatUnits(premium, 6)} mUSD`);
+    if ((alw as bigint) < premium) {
+      const txA = await token.approve(COVER, premium);
+      await txA.wait();
     }
-  };
+
+    // Send buy tx
+    const tx = await cover.buyPolicy(dur, payout);
+    await tx.wait();
+    await readAll();
+  } catch (e: any) {
+    setErr(e?.reason || e?.message || String(e));
+  } finally {
+    setBusy("");
+  }
+};
+
 
   const handleTrigger = async () => {
     try {
