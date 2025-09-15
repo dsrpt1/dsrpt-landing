@@ -1,6 +1,7 @@
 import DSRPTLanding from "@/components/DSRPTLanding";
 
 export default function Page() {
+  return <DSRPTLanding />;
   return (
     <div className="min-h-screen text-white relative">
       {/* 🔹 Futuristic grid background */}
