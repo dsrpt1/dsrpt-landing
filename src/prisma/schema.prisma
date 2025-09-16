@@ -1,0 +1,62 @@
+// src/prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+
+model Quote {
+  id            String   @id @default(cuid())
+  createdAt     DateTime @default(now())
+
+  wallet        String?
+  perilId       String
+  regime        String
+  limitUSD      Int
+  attachmentPct Decimal  @db.Decimal(10,6)
+  tenorDays     Int
+  utilization   Decimal  @db.Decimal(10,6)
+  headroomUSD   Int
+
+  premiumUSD    Decimal  @db.Decimal(18,2)
+  EL            Decimal  @db.Decimal(18,2)
+  RL            Decimal  @db.Decimal(18,2)
+  LL            Decimal  @db.Decimal(18,2)
+  OH            Decimal  @db.Decimal(18,2)
+
+  payload       Json
+
+  @@index([wallet])
+  @@index([createdAt])
+  @@index([perilId, regime])
+}
+
+model Policy {
+  id            String   @id @default(cuid())
+  createdAt     DateTime @default(now())
+
+  wallet        String
+  tokenId       String
+  chainId       Int
+  contract      String
+
+  perilId       String
+  limitUSD      Int
+  attachmentPct Decimal  @db.Decimal(10,6)
+  tenorDays     Int
+  premiumUSD    Decimal  @db.Decimal(18,2)
+
+  txHash        String
+  metadataCID   String
+  metadataURI   String
+
+  @@index([wallet])
+  @@index([contract, tokenId])
+  @@index([createdAt])
+}
