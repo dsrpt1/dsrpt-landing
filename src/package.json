@@ -8,13 +8,21 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@prisma/client": "^6.16.1",
+    "@rainbow-me/rainbowkit": "^2.2.8",
     "next": "15.5.2",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "viem": "^2.37.6",
+    "wagmi": "^2.16.9"
   },
   "devDependencies": {
-    "typescript": "^5.5.0",
+    "@types/node": "^20.11.0",
     "@types/react": "^18.2.66",
-    "@types/node": "^20.11.0"
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "prisma": "^6.16.1",
+    "tailwindcss": "^4.1.13",
+    "typescript": "^5.5.0"
   }
 }
